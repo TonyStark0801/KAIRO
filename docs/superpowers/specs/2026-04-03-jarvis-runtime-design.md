@@ -144,7 +144,7 @@ Pure asyncio pub/sub. No third-party libraries.
 
 | Event | Fields |
 |---|---|
-| `GestureEvent` | `type: GestureType, timestamp: float, metadata: dict` |
+| `GestureEvent` | `type: GestureType, timestamp: float` |
 | `VoiceTranscriptEvent` | `text: str, confidence: float, session_id: str` |
 | `SessionStateChangedEvent` | `old_state: State, new_state: State, session_id: str` |
 | `IntentRoutedEvent` | `tool_name: str, params: dict, confidence: float, session_id: str` |
@@ -167,8 +167,8 @@ Pure asyncio pub/sub. No third-party libraries.
 | From | To | Trigger |
 |---|---|---|
 | SLEEP | WAKE_PENDING | `GestureEvent(type=FACE_VERIFIED)` |
-| WAKE_PENDING | ACTIVE_SESSION | `GestureEvent(type=ALL_SIGNALS_CONFIRMED, within_window=True)` |
-| WAKE_PENDING | SLEEP | Timeout (3s window expired) |
+| WAKE_PENDING | ACTIVE_SESSION | `GestureEvent(type=ALL_SIGNALS_CONFIRMED)` — fusion.py only emits this if all 3 signals arrived within its 3s window |
+| WAKE_PENDING | SLEEP | Timeout (3s window expired without `ALL_SIGNALS_CONFIRMED`) |
 | ACTIVE_SESSION | EXECUTING | `IntentRoutedEvent` |
 | EXECUTING | ACTIVE_SESSION | `ToolExecutionEvent(success=True)` |
 | EXECUTING | ACTIVE_SESSION | `ToolExecutionEvent(success=False)` (with error notification) |
@@ -239,11 +239,19 @@ Frame format: raw BGR numpy arrays, passed by reference.
 
 ## 8. Gesture Fusion (`sensors/gesture/fusion.py`)
 
-Opens a 3-second window on first signal. Tracks `{FACE_VERIFIED, DOUBLE_CLAP, DUAL_SNAP}`.
+Fusion activates **only after the FSM enters `WAKE_PENDING`** (i.e., after `FACE_VERIFIED` is received). Clap and snap signals during `SLEEP` are ignored — face verification is always the first required signal.
 
-- All 3 arrive within 3s → emits `GestureEvent(type=ALL_SIGNALS_CONFIRMED)`
-- Window expires with incomplete set → resets
-- Thread-safe: sensors run in threads, event bus is asyncio. Uses `threading.Lock` for signal tracking, `loop.call_soon_threadsafe()` for event publishing.
+**Sequence:**
+1. Face verifier detects enrolled face → publishes `GestureEvent(type=FACE_VERIFIED)`
+2. State machine transitions `SLEEP → WAKE_PENDING`
+3. Fusion starts its 3-second window, pre-populating `FACE_VERIFIED` as already received
+4. Gesture detector picks up `DOUBLE_CLAP` and `DUAL_SNAP` within the window
+5. When all 3 confirmed → fusion emits `GestureEvent(type=ALL_SIGNALS_CONFIRMED)`
+6. State machine transitions `WAKE_PENDING → ACTIVE_SESSION`
+
+If window expires with incomplete set → fusion resets, state machine transitions `WAKE_PENDING → SLEEP`.
+
+Thread-safe: sensors run in threads, event bus is asyncio. Uses `threading.Lock` for signal tracking, `loop.call_soon_threadsafe()` for event publishing.
 
 ---
 
@@ -274,6 +282,29 @@ Mic (pyaudio, in thread) → VAD → Transcriber (whisper.cpp) → Normalizer �
 - User prompt from `prompts/user.j2`
 - Returns `IntentResult(tool_name, params, confidence, raw_response)`
 - Confidence < 0.6 or no match → `IntentResult(tool_name=None, ...)`
+
+### 10.2 Slot Filler (`core/intent/slot_filler.py`)
+
+Called by the router after LLM returns an `IntentResult` with a matched tool. Compares extracted `params` against the tool's `parameters_schema`. For any required parameter that is missing:
+
+1. Checks session cache for recent context that could fill the slot (e.g., last-used project name)
+2. Checks behavioral patterns (e.g., time-of-day defaults)
+3. If still missing: marks the slot as unfilled
+
+Returns `SlotFillingResult(params: dict, unfilled: list[str])`. If `unfilled` is non-empty, the executor sends a notification asking the user to clarify rather than executing with incomplete params.
+
+### 10.3 Transcript-to-Intent Wiring
+
+The **intent routing subscriber** is wired in `daemon.py`:
+
+1. Subscribes to `VoiceTranscriptEvent` on the event bus
+2. Calls `router.route(transcript, session_context, tool_metas)` → `IntentResult`
+3. Calls `slot_filler.fill(intent_result, tool_schema, session_cache)` → `SlotFillingResult`
+4. If confidence >= 0.6 and no unfilled slots: publishes `IntentRoutedEvent`
+5. If confidence < 0.6: sends notification "I didn't understand that" via adapter
+6. If unfilled slots: sends notification asking for missing info
+
+This is an async function defined in `daemon.py` (not a separate module) since it's pure wiring logic.
 
 ---
 
@@ -359,7 +390,15 @@ Runs on `ACTIVE_SESSION` entry. Collects: current time, day of week, top 3 recen
 
 ### 14.2 Wake Pipeline (`core/pipeline/wake_pipeline.py`)
 
-Orchestrates the transition from `WAKE_PENDING` to `ACTIVE_SESSION`. Coordinates with fusion.py results and session context initialization.
+Subscribes to `SessionStateChangedEvent` where `new_state == WAKE_PENDING`. Responsibilities:
+
+1. Starts/resets the fusion timer (ensures the 3s window is running)
+2. Initializes a new `SessionContext` (generates session_id, records start time)
+3. Writes session start to session cache
+4. On `ALL_SIGNALS_CONFIRMED`: passes the initialized context to the greeting pipeline
+5. On timeout (window expired): cleans up the session context
+
+This is the bridge between the FSM state transition and the sensor fusion layer. It does NOT control the FSM — the FSM transitions on events independently. The wake pipeline prepares the session context so it's ready when `ACTIVE_SESSION` is entered.
 
 ---
 
@@ -383,7 +422,7 @@ Single user only.
 
 ### 16.1 Pydantic Models (`core/config/models.py`)
 
-Already implemented. `JarvisConfig` with nested: `OllamaConfig`, `SessionConfig` (now includes `tool_timeout_seconds: 30`), `MemoryConfig`, `RedisConfig`, `ProjectEntry`, `WorkspaceModeEntry`, `PathsConfig`.
+Partially implemented — existing code in `core/config/models.py` is the source of truth and must be preserved. Will be extended to add `tool_timeout_seconds: int = 30` to `SessionConfig`. Contains: `JarvisConfig` with nested `OllamaConfig`, `SessionConfig`, `MemoryConfig`, `RedisConfig`, `ProjectEntry`, `WorkspaceModeEntry`, `PathsConfig`.
 
 ### 16.2 Loader (`core/config/loader.py`)
 
