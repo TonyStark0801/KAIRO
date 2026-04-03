@@ -3315,7 +3315,9 @@ class GreetingPipeline:
                 pass
 
         greeting = f"{time_greeting}! Happy {day_name}.{tool_hint}{projects_hint} Ready."
-        if len(greeting) > 200:
+        if len(greeting.split()) > 40:
+            greeting = f"{time_greeting}! Happy {day_name}.{tool_hint} Ready."
+        if len(greeting.split()) > 40:
             greeting = f"{time_greeting}! Ready."
         return greeting
 ```
@@ -3982,11 +3984,67 @@ class JarvisDaemon:
             if self._wake_pipeline and self._wake_pipeline.current_context:
                 self._fsm.session_id = self._wake_pipeline.current_context.session_id
 
+    _voice_thread_stop: threading.Event | None = None
+
     def _start_voice_pipeline(self) -> None:
-        pass
+        self._stop_voice_pipeline()
+        self._voice_thread_stop = threading.Event()
+        self._executor_pool.submit(self._voice_capture_loop, self._voice_thread_stop)
+        logger.info("Voice pipeline started")
 
     def _stop_voice_pipeline(self) -> None:
-        pass
+        if self._voice_thread_stop is not None:
+            self._voice_thread_stop.set()
+            self._voice_thread_stop = None
+            logger.info("Voice pipeline stopped")
+
+    def _voice_capture_loop(self, stop_event: threading.Event) -> None:
+        try:
+            import pyaudio
+            from sensors.voice.vad import VoiceActivityDetector
+            from sensors.voice.transcriber import Transcriber
+            from sensors.voice.normalizer import normalize
+
+            pa = pyaudio.PyAudio()
+            stream = pa.open(
+                format=pyaudio.paInt16, channels=1, rate=16000,
+                input=True, frames_per_buffer=480,
+            )
+            vad = VoiceActivityDetector()
+            transcriber = Transcriber()
+            if not transcriber.initialize():
+                logger.error("Whisper init failed in voice pipeline")
+                stream.close()
+                pa.terminate()
+                return
+
+            while not stop_event.is_set():
+                frame = stream.read(480, exception_on_overflow=False)
+                audio_chunk = vad.process_frame(frame)
+                if audio_chunk is not None:
+                    import asyncio as _aio
+                    future = _aio.run_coroutine_threadsafe(
+                        self._process_audio_chunk(audio_chunk, transcriber, normalize),
+                        self._loop,
+                    )
+            stream.close()
+            pa.terminate()
+        except Exception:
+            logger.exception("Voice capture loop error")
+
+    async def _process_audio_chunk(self, audio: bytes, transcriber, normalize_fn) -> None:
+        text = await transcriber.transcribe(audio)
+        if not text:
+            return
+        text = normalize_fn(text)
+        if not text:
+            return
+        session_id = ""
+        if self._wake_pipeline and self._wake_pipeline.current_context:
+            session_id = self._wake_pipeline.current_context.session_id
+        await self._bus.publish(
+            VoiceTranscriptEvent(text=text, confidence=1.0, session_id=session_id)
+        )
 
     _idle_task: asyncio.Task | None = None
 
@@ -4003,6 +4061,7 @@ class JarvisDaemon:
         try:
             await asyncio.sleep(self._config.session.idle_timeout_seconds)
             if self._fsm:
+                await self._adapter.send_notification("Jarvis", "Session timed out — going to sleep")
                 await self._fsm.trigger_idle_timeout()
         except asyncio.CancelledError:
             pass
