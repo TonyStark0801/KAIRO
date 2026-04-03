@@ -152,7 +152,7 @@ Pure asyncio pub/sub. No third-party libraries.
 | `ToolCancelEvent` | `session_id: str, reason: str` |
 | `MemoryWriteEvent` | `tool_name: str, command_text: str, params: dict, session_id: str, timestamp: float` |
 
-`GestureType` enum: `FACE_VERIFIED`, `DOUBLE_CLAP`, `DUAL_SNAP`, `ALL_SIGNALS_CONFIRMED`
+`GestureType` enum: `FACE_VERIFIED`, `DOUBLE_CLAP`, `DUAL_SNAP`, `ALL_SIGNALS_CONFIRMED`, `WAKE_TIMEOUT`
 
 ---
 
@@ -168,11 +168,10 @@ Pure asyncio pub/sub. No third-party libraries.
 |---|---|---|
 | SLEEP | WAKE_PENDING | `GestureEvent(type=FACE_VERIFIED)` |
 | WAKE_PENDING | ACTIVE_SESSION | `GestureEvent(type=ALL_SIGNALS_CONFIRMED)` — fusion.py only emits this if all 3 signals arrived within its 3s window |
-| WAKE_PENDING | SLEEP | Timeout (3s window expired without `ALL_SIGNALS_CONFIRMED`) |
+| WAKE_PENDING | SLEEP | `GestureEvent(type=WAKE_TIMEOUT)` — fusion publishes this when 3s window expires |
 | ACTIVE_SESSION | EXECUTING | `IntentRoutedEvent` |
 | EXECUTING | ACTIVE_SESSION | `ToolExecutionEvent(success=True)` |
-| EXECUTING | ACTIVE_SESSION | `ToolExecutionEvent(success=False)` (with error notification) |
-| EXECUTING | ACTIVE_SESSION | `ToolCancelEvent` (user-initiated or timeout cancel) |
+| EXECUTING | ACTIVE_SESSION | `ToolExecutionEvent(success=False)` (with error notification — covers errors, timeouts, and user cancels) |
 | ACTIVE_SESSION | IDLE_TIMEOUT | 30s idle timer |
 | IDLE_TIMEOUT | SLEEP | Immediately after firing timeout notification |
 
@@ -251,7 +250,7 @@ Clap and snap signals during `SLEEP` are ignored — face verification is always
 5. When all 3 confirmed → fusion emits `GestureEvent(type=ALL_SIGNALS_CONFIRMED)`
 6. State machine transitions `WAKE_PENDING → ACTIVE_SESSION`
 
-If window expires with incomplete set → fusion publishes a timeout event, state machine transitions `WAKE_PENDING → SLEEP`.
+If window expires with incomplete set → fusion publishes `GestureEvent(type=WAKE_TIMEOUT)`, state machine transitions `WAKE_PENDING → SLEEP`.
 
 **Ownership:** Fusion owns its own timer. Nothing else starts, stops, or resets it. Fusion only listens to `SessionStateChangedEvent` to know when to activate.
 
@@ -340,11 +339,13 @@ At startup: walks `tools/` directory, imports modules, finds `BaseTool` subclass
 
 ### 11.4 Tool Cancel Mechanism
 
-**Who publishes `ToolCancelEvent`:** The gesture fusion module. Fusion subscribes to `SessionStateChangedEvent`. When `new_state == EXECUTING`, fusion switches to cancel-detection mode: a dual snap during EXECUTING publishes `ToolCancelEvent` instead of contributing to wake signals.
+**Who publishes `ToolCancelEvent`:** The gesture fusion module. Fusion subscribes to `SessionStateChangedEvent`. When `new_state == EXECUTING`, fusion switches to cancel-detection mode: a dual snap during EXECUTING publishes `ToolCancelEvent` instead of contributing to wake signals. During `ACTIVE_SESSION` (before an intent is routed), clap/snap gestures are ignored — they have no meaning outside of wake and cancel contexts.
 
 **Who handles `ToolCancelEvent`:** The executor. It subscribes to `ToolCancelEvent` on the event bus. When received, it cancels the running `asyncio.Task`, publishes `ToolExecutionEvent(success=False, message="cancelled by user")`, which triggers the state machine transition `EXECUTING → ACTIVE_SESSION`.
 
 **Timeout cancel:** The executor handles this internally via `asyncio.wait_for(timeout=tool_timeout_seconds)`. On timeout, same path: publishes `ToolExecutionEvent(success=False, message="timed out")`.
+
+**State machine note:** The state machine does NOT subscribe to `ToolCancelEvent`. It only transitions on `ToolExecutionEvent`. All cancel/timeout paths go through the executor, which always publishes `ToolExecutionEvent(success=False)` as the canonical exit signal from EXECUTING. `ToolCancelEvent` is consumed solely by the executor.
 
 Both paths result in `EXECUTING → ACTIVE_SESSION`, mic reopens.
 
