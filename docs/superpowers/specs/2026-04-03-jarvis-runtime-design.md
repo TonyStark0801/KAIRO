@@ -175,7 +175,7 @@ Pure asyncio pub/sub. No third-party libraries.
 | ACTIVE_SESSION | IDLE_TIMEOUT | 30s idle timer |
 | IDLE_TIMEOUT | SLEEP | Immediately after firing timeout notification |
 
-Invalid transitions raise `InvalidTransitionError`.
+Invalid transitions raise `InvalidTransitionError`. Events that are simply irrelevant in the current state (e.g., a `GestureEvent` during `ACTIVE_SESSION`) are silently ignored — they are no-ops, not invalid transitions.
 
 Publishes `SessionStateChangedEvent` on every transition.
 
