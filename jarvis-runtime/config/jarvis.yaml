@@ -1,0 +1,77 @@
+ollama:
+  host: localhost
+  port: 11434
+  model: llama3.1
+  embed_model: nomic-embed-text
+
+session:
+  idle_timeout: 30
+  wake_window: 3
+  tool_timeout: 30
+
+memory:
+  chroma_path: ~/.jarvis/chroma
+  behavioral_db: ~/.jarvis/behavior.db
+
+redis:
+  redis_enabled: false
+  url: redis://localhost:6379/0
+
+paths:
+  face_embedding_path: ~/.jarvis/face_embedding.npy
+
+projects:
+  office:
+    name: Office Dashboard
+    path: ~/Projects/office-dashboard
+    intellij_module: office-dashboard
+  codejam:
+    name: CodeJam Solutions
+    path: ~/Projects/codejam
+    intellij_module: codejam
+  personal:
+    name: Personal Site
+    path: ~/Projects/personal-site
+    intellij_module: null
+
+workspace_modes:
+  office:
+    description: Opens office tools and communication apps
+    steps:
+      - tool: open_project
+        params:
+          project: office
+      - tool: open_url
+        params:
+          url: https://mail.google.com
+          browser: Chrome
+      - tool: open_url
+        params:
+          url: https://calendar.google.com
+          browser: Chrome
+
+  focus:
+    description: Deep work mode with IDE and music
+    steps:
+      - tool: open_project
+        params:
+          project: codejam
+      - tool: play_music
+        params:
+          query: focus playlist
+      - tool: open_notes
+        params: {}
+
+  evening:
+    description: Wind-down mode with personal projects
+    steps:
+      - tool: open_project
+        params:
+          project: personal
+      - tool: open_url
+        params:
+          url: https://news.ycombinator.com
+          browser: Chrome
+      - tool: play_music
+        params:
+          query: chill playlist
