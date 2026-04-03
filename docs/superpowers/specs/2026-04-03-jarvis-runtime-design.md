@@ -239,17 +239,21 @@ Frame format: raw BGR numpy arrays, passed by reference.
 
 ## 8. Gesture Fusion (`sensors/gesture/fusion.py`)
 
-Fusion activates **only after the FSM enters `WAKE_PENDING`** (i.e., after `FACE_VERIFIED` is received). Clap and snap signals during `SLEEP` are ignored — face verification is always the first required signal.
+Fusion is **self-managing**. It subscribes to `SessionStateChangedEvent` and activates only when `new_state == WAKE_PENDING`. No other module starts or controls the fusion timer.
+
+Clap and snap signals during `SLEEP` are ignored — face verification is always the first required signal.
 
 **Sequence:**
 1. Face verifier detects enrolled face → publishes `GestureEvent(type=FACE_VERIFIED)`
-2. State machine transitions `SLEEP → WAKE_PENDING`
-3. Fusion starts its 3-second window, pre-populating `FACE_VERIFIED` as already received
+2. State machine transitions `SLEEP → WAKE_PENDING`, publishes `SessionStateChangedEvent`
+3. Fusion receives `SessionStateChangedEvent(new_state=WAKE_PENDING)`, starts its 3-second window, pre-populating `FACE_VERIFIED` as already received
 4. Gesture detector picks up `DOUBLE_CLAP` and `DUAL_SNAP` within the window
 5. When all 3 confirmed → fusion emits `GestureEvent(type=ALL_SIGNALS_CONFIRMED)`
 6. State machine transitions `WAKE_PENDING → ACTIVE_SESSION`
 
-If window expires with incomplete set → fusion resets, state machine transitions `WAKE_PENDING → SLEEP`.
+If window expires with incomplete set → fusion publishes a timeout event, state machine transitions `WAKE_PENDING → SLEEP`.
+
+**Ownership:** Fusion owns its own timer. Nothing else starts, stops, or resets it. Fusion only listens to `SessionStateChangedEvent` to know when to activate.
 
 Thread-safe: sensors run in threads, event bus is asyncio. Uses `threading.Lock` for signal tracking, `loop.call_soon_threadsafe()` for event publishing.
 
@@ -275,7 +279,9 @@ Mic (pyaudio, in thread) → VAD → Transcriber (whisper.cpp) → Normalizer �
 
 ---
 
-## 10. Intent Router (`core/intent/router.py`)
+## 10. Intent System
+
+### 10.1 Router (`core/intent/router.py`)
 
 - Sends transcript + session context + ToolMeta list to Ollama via Python SDK
 - System prompt from `prompts/system.j2` (includes tool registry as JSON + last 5 commands from session cache)
@@ -328,15 +334,19 @@ At startup: walks `tools/` directory, imports modules, finds `BaseTool` subclass
 - Receives `IntentRoutedEvent` from event bus
 - Looks up tool from registry, calls `tool.execute(params, adapter)`
 - **Timeout:** Wraps execution in `asyncio.wait_for(timeout=tool_timeout_seconds)` (default 30s)
-- On completion: publishes `ToolExecutionEvent` and `MemoryWriteEvent`
+- On completion (success or failure): publishes `ToolExecutionEvent` and `MemoryWriteEvent` (both successes and failures are recorded in memory for behavioral analysis)
 - On timeout: cancels task, publishes `ToolExecutionEvent(success=False)`
 - On `ToolCancelEvent`: cancels running task, same recovery path
 
 ### 11.4 Tool Cancel Mechanism
 
-- **Dual snap during EXECUTING** → `ToolCancelEvent` published
-- **Timeout (30s default)** → executor self-cancels
-- Both paths: `EXECUTING → ACTIVE_SESSION`, mic reopens
+**Who publishes `ToolCancelEvent`:** The gesture fusion module. Fusion subscribes to `SessionStateChangedEvent`. When `new_state == EXECUTING`, fusion switches to cancel-detection mode: a dual snap during EXECUTING publishes `ToolCancelEvent` instead of contributing to wake signals.
+
+**Who handles `ToolCancelEvent`:** The executor. It subscribes to `ToolCancelEvent` on the event bus. When received, it cancels the running `asyncio.Task`, publishes `ToolExecutionEvent(success=False, message="cancelled by user")`, which triggers the state machine transition `EXECUTING → ACTIVE_SESSION`.
+
+**Timeout cancel:** The executor handles this internally via `asyncio.wait_for(timeout=tool_timeout_seconds)`. On timeout, same path: publishes `ToolExecutionEvent(success=False, message="timed out")`.
+
+Both paths result in `EXECUTING → ACTIVE_SESSION`, mic reopens.
 
 ---
 
@@ -386,19 +396,23 @@ Every method raises `NotImplementedError`. No Windows imports — importable on 
 
 ### 14.1 Greeting Pipeline (`core/pipeline/greeting_pipeline.py`)
 
-Runs on `ACTIVE_SESSION` entry. Collects: current time, day of week, top 3 recent tools from behavioral store, open IntelliJ projects, last session timestamp. Formats greeting < 40 words. Speaks via `adapter.run_script()` (macOS `say` command). Fire-and-forget.
+Subscribes to `SessionStateChangedEvent` where `new_state == ACTIVE_SESSION`. This is the sole trigger — no other module invokes the greeting pipeline. Collects: current time, day of week, top 3 recent tools from behavioral store, open IntelliJ projects, last session timestamp. Formats greeting < 40 words. Speaks via `adapter.run_script()` (macOS `say` command). Fire-and-forget via `asyncio.create_task`.
 
 ### 14.2 Wake Pipeline (`core/pipeline/wake_pipeline.py`)
 
-Subscribes to `SessionStateChangedEvent` where `new_state == WAKE_PENDING`. Responsibilities:
+Subscribes to `SessionStateChangedEvent` where `new_state == WAKE_PENDING`. Single responsibility: **session context initialization**.
 
-1. Starts/resets the fusion timer (ensures the 3s window is running)
-2. Initializes a new `SessionContext` (generates session_id, records start time)
-3. Writes session start to session cache
-4. On `ALL_SIGNALS_CONFIRMED`: passes the initialized context to the greeting pipeline
-5. On timeout (window expired): cleans up the session context
+1. Creates a new `SessionContext` (generates session_id, records start time)
+2. Writes session start to session cache
+3. Stores the context so it's available when `ACTIVE_SESSION` is entered
 
-This is the bridge between the FSM state transition and the sensor fusion layer. It does NOT control the FSM — the FSM transitions on events independently. The wake pipeline prepares the session context so it's ready when `ACTIVE_SESSION` is entered.
+The wake pipeline does NOT control fusion, timers, or the greeting. It only prepares the session context.
+
+**Clear ownership boundaries:**
+- **Fusion** owns the 3s timer and signal tracking (Section 8)
+- **Wake pipeline** owns session context creation (this section)
+- **Greeting pipeline** owns the greeting (Section 14.1) — triggers on `SessionStateChangedEvent(new_state=ACTIVE_SESSION)`, reads the context that wake pipeline prepared
+- **State machine** owns transitions — all three pipelines react to its events, none control it
 
 ---
 
@@ -475,7 +489,7 @@ Standard `logging` module. Root logger configured in `daemon.py`:
 ## 20. Implementation Rules
 
 1. ZERO platform imports in `core/` or `tools/`
-2. ALL inter-module communication via event bus
+2. ALL inter-module communication via event bus. Exception: `daemon.py` (the composition root) may call core modules directly for wiring — it constructs objects, passes config, and registers event subscriptions. Once running, all runtime communication goes through the bus.
 3. Tool plugins are self-contained (import only `_base.py`, pydantic, stdlib)
 4. Async-first (single event loop, threads bridge via `call_soon_threadsafe`)
 5. Config loaded once, injected via constructors
