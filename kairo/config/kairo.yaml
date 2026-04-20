@@ -10,6 +10,18 @@ stt:
   model: small.en        # command transcription
   wake_model: small.en   # wake-word too — tiny.en accuracy is insufficient for Indian English
   cpp_fallback_model: small.en
+  # mlx-whisper bias — same idea as newThing/test.py (Indian English, coding context).
+  initial_prompt: "A software engineer in Mumbai speaking Indian English about coding."
+
+# Mic: auto = sounddevice if scipy+sounddevice installed (same as newThing), else PyAudio.
+# sounddevice path feeds the daemon agent / reasoner / LLM / TTS unchanged (VoiceTranscriptEvent).
+mic:
+  backend: auto
+  sd_threshold: 0.04
+  sd_silence_chunks: 10
+  sd_chunk_seconds: 0.1
+  sd_min_duration_seconds: 0.25
+  sd_show_meter: false
 
 wake:
   engine: stt_keyword

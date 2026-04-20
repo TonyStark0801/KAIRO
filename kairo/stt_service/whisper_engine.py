@@ -10,12 +10,19 @@ Priority (when engine="auto"):
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 
 from stt_service.base import STTEngine, TranscriptMeta
 
 logger = logging.getLogger(__name__)
+
+# Biases short assistant-style utterances; reduces "thank you for watching" hallucinations on brief clips.
+_MLX_INITIAL_PROMPT = (
+    "Hi, hello, hey, hi there, good morning. "
+    "Short spoken phrases to a voice assistant."
+)
 
 # mlx-whisper uses HuggingFace repo paths from mlx-community.
 # Map friendly model names (same ones faster-whisper uses) to HF repos.
@@ -42,10 +49,12 @@ class WhisperEngine(STTEngine):
         model_name: str = "large-v3",
         cpp_fallback_model: str = "small.en",
         engine: str = "auto",
+        initial_prompt: str | None = None,
     ) -> None:
         self._model_name = model_name
         self._cpp_fallback_model = cpp_fallback_model
         self._engine_hint = engine.lower().strip()
+        self._mlx_initial_prompt = initial_prompt if initial_prompt else _MLX_INITIAL_PROMPT
         self._model = None
         self._backend: str = ""
         self._backend_failed: bool = False  # circuit breaker: True after unrecoverable error
@@ -79,6 +88,9 @@ class WhisperEngine(STTEngine):
             import mlx_whisper  # type: ignore[import-untyped]
             from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
 
+            # Avoid tqdm stderr fighting logging (garbled lines, trailing "Download complete" after Ctrl+C).
+            os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
             repo = _MLX_MODEL_MAP.get(self._model_name, self._model_name)
             logger.info("Whisper: downloading/verifying mlx model '%s' …", repo)
 
@@ -95,7 +107,15 @@ class WhisperEngine(STTEngine):
             # doesn't block with a cold load. mlx_whisper.ModelHolder caches by path.
             logger.info("Whisper: warming up mlx model (first load may take a few seconds) …")
             _dummy = np.zeros(1600, dtype=np.float32)  # 0.1s silence — minimal compute
-            mlx_whisper.transcribe(_dummy, path_or_hf_repo=local_path, language="en", verbose=False)
+            # verbose=None disables tqdm (verbose=False actually enables the progress bar).
+            mlx_whisper.transcribe(
+                _dummy,
+                path_or_hf_repo=local_path,
+                language="en",
+                verbose=None,
+                temperature=(0.0,),
+                condition_on_previous_text=False,
+            )
             logger.info("Whisper backend: mlx-whisper ready (model=%s)", repo)
             return True
         except ImportError:
@@ -180,7 +200,10 @@ class WhisperEngine(STTEngine):
             audio,
             path_or_hf_repo=self._model,
             language="en",
-            verbose=False,
+            verbose=None,
+            temperature=(0.0,),
+            condition_on_previous_text=False,
+            initial_prompt=self._mlx_initial_prompt,
         )
         if not isinstance(result, dict):
             return TranscriptMeta(text=str(result).strip().lower(), speech_prob=1.0)

@@ -60,6 +60,8 @@ class SttConfig(BaseModel):
     model: str = "small.en"       # command transcription
     wake_model: str = "tiny.en"   # wake-word detection — ultra-lightweight
     cpp_fallback_model: str = "tiny.en"
+    # mlx-whisper only: steers accent/domain (e.g. Indian English). If unset, Kairo uses a short generic prompt.
+    initial_prompt: str | None = None
 
 
 class WakeConfig(BaseModel):
@@ -115,6 +117,25 @@ class ProactiveConfig(BaseModel):
     focus_suggestions: bool = True
 
 
+class MicConfig(BaseModel):
+    """Microphone capture for the daemon.
+
+    backend:
+      auto         — use sounddevice segmentation if scipy+sounddevice installed, else PyAudio
+      sounddevice  — same pipeline as newThing/test.py (high-pass, peak gate, silence tail)
+      pyaudio      — legacy VAD + PyAudio (openWakeWord streaming works only with this path)
+    """
+
+    backend: str = "auto"
+    sd_threshold: float = 0.04
+    sd_threshold_media: float | None = None  # default: sd_threshold * 2.2 when unset
+    sd_silence_chunks: int = 10
+    sd_chunk_seconds: float = 0.1
+    sd_min_duration_seconds: float = 0.25
+    sd_device: int | None = None
+    sd_show_meter: bool = False
+
+
 class ObserverConfig(BaseModel):
     """Phase 2 context observer — polls active window, browser tab, clipboard."""
 
@@ -132,6 +153,7 @@ class ObserverConfig(BaseModel):
 class KairoConfig(BaseModel):
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     stt: SttConfig = Field(default_factory=SttConfig)
+    mic: MicConfig = Field(default_factory=MicConfig)
     wake: WakeConfig = Field(default_factory=WakeConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)

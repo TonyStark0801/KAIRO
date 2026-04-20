@@ -23,8 +23,16 @@ _EDGE_VOICE = "en-US-AriaNeural"
 
 
 class PiperVoiceEngine(VoiceEngine):
-    def __init__(self, model: str = "en_US-amy-medium") -> None:
+    def __init__(
+        self,
+        model: str = "en_US-amy-medium",
+        *,
+        local_only: bool = False,
+        require_piper: bool = False,
+    ) -> None:
         self._model = model
+        self._local_only = local_only
+        self._require_piper = require_piper
         self._piper_path: str | None = None
         self._model_path: str | None = None
         self._engine: str = "say"
@@ -32,14 +40,15 @@ class PiperVoiceEngine(VoiceEngine):
         self._interrupted = False
 
     async def initialize(self) -> bool:
-        if shutil.which("mpv"):
-            try:
-                import edge_tts  # noqa: F401
-                self._engine = "edge_stream"
-                logger.info("Voice engine: Edge TTS streaming (voice=%s)", _EDGE_VOICE)
-                return True
-            except ImportError:
-                logger.info("edge-tts not installed, trying Piper")
+        if not self._local_only:
+            if shutil.which("mpv"):
+                try:
+                    import edge_tts  # noqa: F401
+                    self._engine = "edge_stream"
+                    logger.info("Voice engine: Edge TTS streaming (voice=%s)", _EDGE_VOICE)
+                    return True
+                except ImportError:
+                    logger.info("edge-tts not installed, trying Piper")
 
         self._piper_path = shutil.which("piper")
         if self._piper_path:
@@ -50,6 +59,13 @@ class PiperVoiceEngine(VoiceEngine):
                 self._engine = "piper"
                 logger.info("Voice engine: Piper (model=%s)", self._model)
                 return True
+            if self._require_piper:
+                logger.error("Piper model missing: %s", model_file)
+                return False
+
+        if self._require_piper:
+            logger.error("piper binary not found on PATH")
+            return False
 
         self._engine = "say"
         logger.info("Voice engine: macOS say (voice=%s, rate=%s)", _SAY_VOICE, _SAY_RATE)

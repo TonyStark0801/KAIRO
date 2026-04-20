@@ -50,6 +50,8 @@ from runtime.health import HealthStatus, HealthTracker
 from sensors.voice.voice_verifier import VoiceVerifier
 from sensors.wake.factory import try_create_openwakeword_stream
 from stt_service.mic_listener import MicListener, MicMode
+from stt_service.sounddevice_mic_listener import SounddeviceMicListener
+from stt_service.sounddevice_segmenter import try_import_deps as try_sounddevice_mic_deps
 from stt_service.whisper_engine import WhisperEngine
 from voice_service.piper_engine import PiperVoiceEngine
 
@@ -259,6 +261,7 @@ class KairoDaemon:
             model_name=cfg.model,
             cpp_fallback_model=cfg.cpp_fallback_model,
             engine=cfg.engine,
+            initial_prompt=cfg.initial_prompt,
         )
         if self._stt.initialize():
             self._health.mark("whisper", HealthStatus.HEALTHY)
@@ -272,6 +275,7 @@ class KairoDaemon:
             model_name=cfg.wake_model,
             cpp_fallback_model=cfg.cpp_fallback_model,
             engine=cfg.engine,
+            initial_prompt=cfg.initial_prompt,
         )
         if self._wake_stt.initialize():
             logger.info("Wake STT ready (model=%s)", cfg.wake_model)
@@ -401,22 +405,65 @@ class KairoDaemon:
             verification_mode=verification_mode,
         )
 
-        # Mic listener with optional voice verifier and openWakeWord streaming detector
+        # Mic listener: sounddevice segmentation (newThing-style) or PyAudio + optional openWakeWord
         wake_words = self._identity.wake_words if self._identity else None
-        oww = try_create_openwakeword_stream(self._config.wake)
-        if oww:
-            logger.info("Wake engine: openWakeWord streaming")
-        elif self._config.wake.engine == "openwakeword":
-            logger.warning("openWakeWord unavailable — falling back to STT keyword wake")
-        self._mic = MicListener(
-            stt_engine=self._stt,
-            event_bus=self._bus,
-            loop=self._loop,
-            wake_words=wake_words,
-            voice_verifier=self._voice_verifier,
-            openwakeword_detector=oww,
-            wake_stt_engine=self._wake_stt,
-        )
+        mic_cfg = self._config.mic
+        use_sounddevice = False
+        if mic_cfg.backend == "sounddevice":
+            if try_sounddevice_mic_deps() is None:
+                use_sounddevice = True
+            else:
+                logger.error(
+                    "mic.backend=sounddevice but sounddevice/scipy missing — "
+                    "install: pip install -e '.[sd-mic]'. Using PyAudio."
+                )
+        elif mic_cfg.backend == "auto":
+            use_sounddevice = try_sounddevice_mic_deps() is None
+
+        oww = None
+        if not use_sounddevice:
+            oww = try_create_openwakeword_stream(self._config.wake)
+            if oww:
+                logger.info("Wake engine: openWakeWord streaming")
+            elif self._config.wake.engine == "openwakeword":
+                logger.warning("openWakeWord unavailable — falling back to STT keyword wake")
+        else:
+            if self._config.wake.engine == "openwakeword" and self._config.wake.openwakeword_models:
+                logger.warning(
+                    "openWakeWord is not used with sounddevice mic; "
+                    "wake phrases are detected via STT on each utterance segment"
+                )
+            logger.info("Mic capture: sounddevice (high-pass + peak gate + silence tail → agent/LLM path)")
+
+        if use_sounddevice:
+            td_media = mic_cfg.sd_threshold_media
+            if td_media is None:
+                td_media = mic_cfg.sd_threshold * 2.2
+            self._mic = SounddeviceMicListener(
+                self._stt,
+                self._bus,
+                self._loop,
+                sd_threshold=mic_cfg.sd_threshold,
+                sd_threshold_media=td_media,
+                sd_silence_chunks=mic_cfg.sd_silence_chunks,
+                sd_chunk_seconds=mic_cfg.sd_chunk_seconds,
+                sd_min_duration_seconds=mic_cfg.sd_min_duration_seconds,
+                sd_device=mic_cfg.sd_device,
+                sd_show_meter=mic_cfg.sd_show_meter,
+                wake_words=wake_words,
+                voice_verifier=self._voice_verifier,
+                wake_stt_engine=self._wake_stt,
+            )
+        else:
+            self._mic = MicListener(
+                stt_engine=self._stt,
+                event_bus=self._bus,
+                loop=self._loop,
+                wake_words=wake_words,
+                voice_verifier=self._voice_verifier,
+                openwakeword_detector=oww,
+                wake_stt_engine=self._wake_stt,
+            )
         def _on_interrupt():
             logger.info("User interrupted speech")
             if self._voice:

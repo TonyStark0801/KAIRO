@@ -42,9 +42,15 @@ wake = [
 mlx = [
     "mlx-whisper>=0.4.0",
 ]
+# sounddevice + scipy: same mic segmentation as newThing/test.py (high-pass, peak gate, silence tail)
+sd-mic = [
+    "sounddevice>=0.4.6",
+    "scipy>=1.10",
+]
 
 [project.scripts]
 kairo = "runtime.daemon:main"
+kairo-echo = "stt_service.echo_cli:main"
 kairo-enroll-face = "sensors.gesture.face_verifier:enroll_cli"
 kairo-enroll-voice = "sensors.voice.voice_verifier:enroll_voice_cli"
 
