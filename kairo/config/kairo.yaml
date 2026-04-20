@@ -1,0 +1,114 @@
+ollama:
+  host: localhost
+  port: 11434
+  model: qwen:4b
+  fast_model: qwen:4b
+  embed_model: nomic-embed-text
+
+stt:
+  engine: mlx-whisper
+  model: small.en        # command transcription
+  wake_model: small.en   # wake-word too — tiny.en accuracy is insufficient for Indian English
+  cpp_fallback_model: small.en
+
+wake:
+  engine: stt_keyword
+  openwakeword_models: []
+  openwakeword_threshold: 0.5
+  openwakeword_inference_framework: tflite
+
+session:
+  idle_timeout: 45
+  wake_window: 10
+  tool_timeout: 30
+
+memory:
+  chroma_path: ~/.kairo/chroma
+  behavioral_db: ~/.kairo/behavior.db
+
+redis:
+  redis_enabled: false
+  url: redis://localhost:6379/0
+
+paths:
+  face_embedding_path: ~/.kairo/face_embedding.npy
+
+browser:
+  app_name: "Brave Browser"
+
+projects:
+  office:
+    name: Office Dashboard
+    path: ~/Projects/office-dashboard
+    intellij_module: office-dashboard
+  codejam:
+    name: CodeJam Solutions
+    path: ~/Projects/codejam
+    intellij_module: codejam
+  personal:
+    name: Personal Site
+    path: ~/Projects/personal-site
+    intellij_module: null
+
+groq:
+  api_key_env: GROQ_API_KEY
+  model: llama-3.3-70b-versatile
+  max_tokens: 1024
+  temperature: 0.7
+
+proactive:
+  enabled: true
+  check_interval: 60
+  morning_briefing: true
+  todo_reminders: true
+  focus_suggestions: true
+
+workspace_modes:
+  office:
+    description: Opens office tools and communication apps
+    steps:
+      - tool: open_project
+        params:
+          project: office
+      - tool: open_url
+        params:
+          url: https://mail.google.com
+          browser: Brave Browser
+      - tool: open_url
+        params:
+          url: https://calendar.google.com
+          browser: Brave Browser
+
+  focus:
+    description: Deep work mode with IDE and music
+    steps:
+      - tool: open_project
+        params:
+          project: codejam
+      - tool: youtube_search
+        params:
+          query: focus playlist
+      - tool: open_notes
+        params: {}
+
+  evening:
+    description: Wind-down mode with personal projects
+    steps:
+      - tool: open_project
+        params:
+          project: personal
+      - tool: open_url
+        params:
+          url: https://news.ycombinator.com
+          browser: Brave Browser
+      - tool: youtube_search
+        params:
+          query: chill vibes playlist
+
+
+observer:
+  platform: macos
+  poll_interval_ms: 800
+  capture_frontmost_window: true
+  capture_browser_tab: true
+  capture_clipboard: true

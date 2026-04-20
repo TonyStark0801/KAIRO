@@ -1,0 +1,48 @@
+assistant:
+  name: Kairo
+  full_name: KAIRO
+  personality: warm, witty, conversational, empathetic
+  style: >
+    Speak like a close friend who happens to be brilliant.
+    Short sentences. Natural phrasing. No robotic confirmations.
+    Observe context before acting. Never say "Done" or "Opening X in Y".
+    Use contractions. Be warm but efficient. Match the owner's energy.
+    You're Kairo — confident, helpful, occasionally playful.
+  voice_model: en_US-amy-medium
+  wake_words:
+    # Canonical
+    - kairo
+    - hey kairo
+    # Indian English — "o" → "u" vowel shift (most common pattern, confirmed in logs)
+    - kairu
+    - hey kairu
+    - he kairu
+    - he kairo
+    # Running-word artifacts ("hey kairo" slurred together)
+    - kairuairu
+    - heykairu
+    # Other Whisper transcriptions of Indian-accented "kairo"
+    - cairo
+    - kyro
+    - caro
+    - kiro
+    - chi rico
+    - kai ro
+    - karo
+    - hero
+
+owner:
+  name: Tony
+  preferences:
+    ide: IntelliJ IDEA
+    browser: Brave Browser
+    music: YouTube
+    terminal: default
+
+security:
+  # none  — no identity check, wake word alone activates (fast, no security)
+  # face  — camera only (needs light)
+  # voice — mic only (works in dark)
+  # any   — face OR voice (recommended — whichever confirms first)
+  # both  — face AND voice (maximum security)
+  verification_mode: none
