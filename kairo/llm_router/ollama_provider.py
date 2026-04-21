@@ -1,14 +1,21 @@
-"""Ollama LLM provider — supports fast (3b) and deep (8b) models."""
+"""Ollama LLM provider — single local model (qwen2.5:3b) as the unified brain.
+
+No more 3-tier escalation. One model, one client, one connection pool.
+Client is created once in initialize() and reused — no per-call leaks.
+"""
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from llm_router.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
-_MAX_HISTORY = 20
+# 10 turns = 20 messages (user + assistant pairs). Enough context without
+# hammering RAM. Older turns are already summarized into session memory.
+_MAX_HISTORY = 10
 
 
 class OllamaProvider(LLMProvider):
@@ -16,14 +23,15 @@ class OllamaProvider(LLMProvider):
         self,
         host: str = "localhost",
         port: int = 11434,
-        model: str = "qwen3:4b-instruct-q4_K_M",
-        fast_model: str = "llama3.2:3b",
+        model: str = "qwen2.5:3b",
+        fast_model: str = "qwen2.5:3b",
     ) -> None:
         self._host = host
         self._port = port
         self._model = model
         self._fast_model = fast_model
         self._healthy = False
+        self._client: Any = None  # created once in initialize(), reused across calls
 
     @property
     def healthy(self) -> bool:
@@ -40,42 +48,46 @@ class OllamaProvider(LLMProvider):
     async def initialize(self) -> bool:
         try:
             import ollama
-            client = ollama.AsyncClient(host=f"http://{self._host}:{self._port}")
-            await client.list()
+            # Create client once — reused for all subsequent calls.
+            # Avoids creating a new httpx connection pool per chat() call (ResourceWarning source).
+            self._client = ollama.AsyncClient(host=f"http://{self._host}:{self._port}")
+            await self._client.list()
             self._healthy = True
             logger.info(
-                "Ollama connected: %s:%d fast=%s deep=%s",
-                self._host, self._port, self._fast_model, self._model,
+                "Ollama connected: %s:%d model=%s",
+                self._host, self._port, self._model,
             )
-            # Warm up both models so first call isn't slow
-            await self._warmup(client)
+            await self._warmup()
             return True
         except Exception:
             logger.exception("Failed to connect to Ollama")
+            self._client = None
             return False
 
-    async def _warmup(self, client) -> None:
-        """Pre-load only the fast model — deep model uses Groq cloud now."""
-        import ollama
+    async def close(self) -> None:
+        """Explicitly close the underlying httpx client on SIGINT / shutdown."""
+        self._healthy = False
+        if self._client is not None:
+            try:
+                # ollama.AsyncClient wraps httpx.AsyncClient; close() drains the connection pool.
+                await self._client._client.aclose()
+                logger.info("Ollama client closed cleanly")
+            except Exception:
+                pass
+            self._client = None
+
+    async def _warmup(self) -> None:
+        """Pre-load the model so the first real call isn't penalised by a cold load."""
         try:
-            await client.chat(
-                model=self._fast_model,
+            await self._client.chat(
+                model=self._model,
                 messages=[{"role": "user", "content": "hi"}],
                 options={"num_predict": 1},
+                keep_alive="5m",
             )
-            logger.info("Warmed up model: %s", self._fast_model)
+            logger.info("Warmed up model: %s", self._model)
         except Exception:
-            logger.warning("Warmup failed for %s (will load on first use)", self._fast_model)
-        # Unload the deep model if it was previously cached
-        try:
-            await client.chat(
-                model=self._model,
-                messages=[{"role": "user", "content": ""}],
-                keep_alive=0,
-            )
-            logger.info("Unloaded deep model %s to save memory (Groq handles Tier 3)", self._model)
-        except Exception:
-            pass
+            logger.warning("Warmup failed for %s (will load on first use)", self._model)
 
     async def chat(
         self,
@@ -83,22 +95,21 @@ class OllamaProvider(LLMProvider):
         messages: list[dict[str, str]],
         model_override: str | None = None,
     ) -> str:
-        if not self._healthy:
+        if not self._healthy or self._client is None:
             return ""
 
         model = model_override or self._model
 
         full_messages = [{"role": "system", "content": system_prompt}]
+        # Trim to last N turns. Each turn = 1 user + 1 assistant message.
         trimmed = messages[-_MAX_HISTORY:] if len(messages) > _MAX_HISTORY else messages
         full_messages.extend(trimmed)
 
         try:
-            import ollama
-            client = ollama.AsyncClient(host=f"http://{self._host}:{self._port}")
-            response = await client.chat(
+            response = await self._client.chat(
                 model=model,
                 messages=full_messages,
-                keep_alive="10m",
+                keep_alive="5m",
             )
             return response["message"]["content"]
         except Exception:

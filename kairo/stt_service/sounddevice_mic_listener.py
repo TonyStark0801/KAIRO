@@ -59,6 +59,10 @@ class SounddeviceMicListener(MicListener):
         self._sd_threshold_media = (
             sd_threshold_media if sd_threshold_media is not None else sd_threshold * 2.2
         )
+        # During TTS playback, raise threshold aggressively to block earphone bleed.
+        # 0.04 (normal) → 0.15 (speaking): requires ~4x louder audio for capture.
+        # A user's deliberate barge-in shout clears this; KAIRO's TTS bleed doesn't.
+        self._sd_threshold_speaking = sd_threshold * 3.75
         self._sd_silence_chunks = sd_silence_chunks
         self._sd_chunk_seconds = sd_chunk_seconds
         self._sd_min_duration_seconds = sd_min_duration_seconds
@@ -72,6 +76,9 @@ class SounddeviceMicListener(MicListener):
             return
 
         def threshold() -> float:
+            # Priority: speaking > media playing > normal
+            if self._is_speaking:
+                return self._sd_threshold_speaking
             return self._sd_threshold_media if self._media_playing else self._sd_threshold
 
         def should_process() -> bool:

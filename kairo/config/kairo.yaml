@@ -1,8 +1,8 @@
 ollama:
   host: localhost
   port: 11434
-  model: qwen:4b
-  fast_model: qwen:4b
+  model: qwen2.5:3b
+  fast_model: qwen2.5:3b
   embed_model: nomic-embed-text
 
 stt:

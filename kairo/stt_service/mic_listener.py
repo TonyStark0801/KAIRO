@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 
 _SAMPLE_RATE = 16000
 _FRAME_SIZE = 480
-_ENERGY_NORMAL = 700   # raised from 200 — filters ceiling fan / AC hum (~300-600 RMS)
-_ENERGY_MEDIA = 1500
+_ENERGY_NORMAL = 700    # filters ceiling fan / AC hum (~300-600 RMS)
+_ENERGY_MEDIA = 1500    # raised threshold when media is playing
+_ENERGY_BARGE_IN = 3932 # 0.12 * 32768 — requires intentional loud command to cut through earphone playback
 _SILENCE_AFTER_SPEECH = 0.5  # longer silence gate — reduces spurious captures
 _MAX_PHRASE_SECONDS = 4.0
 _POST_COMMAND_COOLDOWN = 0.8
@@ -62,20 +63,22 @@ class MicListener:
         self._loop = loop
         self._oww_detector = openwakeword_detector
         self._wake_words = wake_words or [
-            # Canonical + OWW-matched
+            # Canonical
             "kairo", "hey kairo",
             # Indian English phonetic variants — retroflex r, different stress
-            "cairo", "kyro", "caro", "kiro", "keiro", "kaero",
+            "cairo", "kyro", "kiro", "keiro", "kaero",
             "kai ro", "ky ro", "ki ro",
-            # Whisper hallucinations from accented "kairo"
-            "hero", "tyro", "micro", "high row", "karo", "kyrow",
-            "k row", "cayro", "care o",
+            # Whisper transcription variants (NOT common English words)
+            "karo", "kyrow", "cayro", "care o",
+            # Deliberately removed: "hero", "micro", "tyro", "high row", "caro", "k row"
+            # These are too common in song lyrics / ambient speech → high false-positive rate
         ]
         self._voice_verifier = voice_verifier
         self._mode = MicMode.IDLE
         self._mode_lock = threading.Lock()
         self._session_id = ""
         self._media_playing = False
+        self._is_speaking = False  # True while KAIRO's TTS is playing through earphones
         self._interrupt_callback = None
         self._interrupt_words = {"stop", "shut up", "quiet", "enough", "never mind", "nevermind", "ok stop", "stop it"}
 
@@ -98,11 +101,24 @@ class MicListener:
 
     def set_media_playing(self, playing: bool) -> None:
         self._media_playing = playing
-        threshold = _ENERGY_MEDIA if playing else _ENERGY_NORMAL
-        logger.info("Mic energy threshold: %d (media=%s)", threshold, playing)
+        logger.info("Mic energy threshold: %d (media=%s, speaking=%s)",
+                    self._energy_threshold, playing, self._is_speaking)
+
+    def set_speaking(self, speaking: bool) -> None:
+        """Raise mic threshold while KAIRO is talking through earphones.
+
+        Earphone feedback means the mic hears KAIRO's voice directly at low volume.
+        At normal threshold (700 RMS) that bleeds through as ghost commands.
+        Barge-in requires the user to speak at ~12% of int16 max — loud enough
+        to be intentional, quiet enough to not need shouting.
+        """
+        self._is_speaking = speaking
+        logger.info("Mic energy threshold: %d (speaking=%s)", self._energy_threshold, speaking)
 
     @property
     def _energy_threshold(self) -> float:
+        if self._is_speaking:
+            return _ENERGY_BARGE_IN
         return _ENERGY_MEDIA if self._media_playing else _ENERGY_NORMAL
 
     def run(self, stop_event: threading.Event) -> None:
@@ -348,7 +364,8 @@ class MicListener:
         1. Exact substring — fast, zero false positives.
         2. Fuzzy per-ngram — catches accent variants without an exhaustive list.
            Uses difflib.SequenceMatcher (stdlib, no extra deps).
-           Threshold 0.78: "kairu" ↔ "kairo" = 0.80 ✓, "cairo" ↔ "kairo" = 0.80 ✓
+           Threshold 0.82: "kairu" ↔ "kairo" = 0.89 ✓, "cairo" ↔ "kairo" = 0.80 ✓
+                           "hello" ↔ "kairo" = 0.20 ✗, "fire" ↔ "kairo" = 0.22 ✗
         """
         import difflib
 
@@ -365,7 +382,7 @@ class MicListener:
             for i in range(max(1, len(text_words) - n + 1)):
                 ngram = " ".join(text_words[i : i + n])
                 ratio = difflib.SequenceMatcher(None, ngram, keyword).ratio()
-                if ratio >= 0.78:
+                if ratio >= 0.82:
                     logger.debug("Fuzzy wake match: '%s' ~ '%s' (%.2f)", ngram, keyword, ratio)
                     return keyword
 
@@ -375,6 +392,14 @@ class MicListener:
         meta = self._transcribe_meta(audio_bytes, wake=False)
         text = meta.text
 
+        # During TTS playback: raise the bar significantly.
+        # KAIRO's own voice bleeds through earphones at low speech_prob (~0.45-0.55).
+        # A real barge-in command from the user will have higher speech_prob AND volume.
+        # This filters TTS echoes without blocking intentional interruptions.
+        if self._is_speaking and meta.speech_prob < 0.70:
+            logger.debug("Command rejected during TTS (speech_prob=%.2f): '%s'", meta.speech_prob, text)
+            return
+
         # Hard speech probability filter — if Whisper is > 55% sure it's NOT speech,
         # drop it. This kills ambient conversation, background TV, half-heard words.
         if meta.speech_prob < 0.45:
@@ -383,6 +408,17 @@ class MicListener:
 
         if not text or text.startswith("[") or text.startswith("("):
             return
+
+        # Interrupt check in COMMAND mode: if KAIRO is speaking and user says a stop word,
+        # fire the interrupt callback instead of routing to the LLM.
+        # (In WAKE_WORD mode this is already handled in _handle_wake_word.)
+        if self._is_speaking:
+            text_lower_check = text.lower().strip().rstrip(".,!?")
+            if text_lower_check in self._interrupt_words or any(w in text_lower_check for w in self._interrupt_words):
+                logger.info("Interrupt word during command mode: '%s'", text)
+                if self._interrupt_callback:
+                    self._interrupt_callback()
+                return
 
         from sensors.voice.normalizer import normalize, looks_like_music, looks_like_noise, looks_like_ambient
         raw_text = text

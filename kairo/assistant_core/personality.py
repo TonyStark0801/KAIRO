@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -44,45 +43,24 @@ class Personality:
         tool_metas: list[ToolMeta],
         recent_commands: list[str] | None = None,
     ) -> str:
-        tools_json = json.dumps(
-            [
-                {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters_schema,
-                }
-                for t in tool_metas
-            ],
-            indent=2,
-        )
+        # Flat name+description list — full parameter schemas are too many tokens
+        # for a 3-4b model and cause the JSON-output hallucination / fence-confusion bug.
+        tools_list = [{"name": t.name, "description": t.description} for t in tool_metas]
 
         workspace_ctx = await self._context.get_context()
         workspace_summary = workspace_ctx.natural_summary()
 
-        last_session = await self._session_store.get_last_session()
-        last_summary = last_session["summary"] if last_session else ""
-
         now = datetime.datetime.now()
-        hour = now.hour
-        if 5 <= hour < 12:
-            time_of_day = f"morning ({now.strftime('%I:%M %p')})"
-        elif 12 <= hour < 17:
-            time_of_day = f"afternoon ({now.strftime('%I:%M %p')})"
-        elif 17 <= hour < 21:
-            time_of_day = f"evening ({now.strftime('%I:%M %p')})"
-        else:
-            time_of_day = f"night ({now.strftime('%I:%M %p')})"
+        # Full datetime string so the model can answer "what's the date" without guessing.
+        current_datetime = now.strftime("%A, %B %d %Y, %I:%M %p")  # e.g. "Tuesday, April 21 2026, 02:08 AM"
 
         template = self._jinja.get_template("system.j2")
         return template.render(
             assistant_name=self._identity.assistant_name,
             owner_name=self._identity.owner_name,
-            personality=self._identity.personality,
-            style=self._identity.style,
             workspace_context=workspace_summary,
-            last_session_summary=last_summary,
-            time_of_day=time_of_day,
-            tools_json=tools_json,
+            current_datetime=current_datetime,
+            tools_list=tools_list,
             recent_commands=recent_commands or [],
         )
 

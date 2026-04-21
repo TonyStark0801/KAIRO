@@ -3,3 +3,13 @@
 *.egg-info/
 __pycache__/
 *.py[cod]
+
+# Model weights — never commit binaries
+*.safetensors
+*.bin
+*.gguf
+*.onnx
+*.pt
+*.pth
+models/
+newThing/whisper-model/

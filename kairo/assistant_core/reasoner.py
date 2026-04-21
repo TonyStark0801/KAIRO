@@ -1,25 +1,26 @@
-"""Reasoner — 3-tier brain with fast-path, small model, and cloud agent loop.
+"""Reasoner — 2-tier brain: keyword fast-path + single local LLM.
 
 Tier 1: Keyword fast-path  → instant (0ms)
-Tier 2: Fast model (3b)    → intent routing (~0.5-1s)
-Tier 3: Cloud agent loop   → Groq 70B with tool calling (~1-3s)
+Tier 2: Local model        → handles everything including web_search via inline loop
+
+No Groq. No escalation. One model does it all.
+If the model emits web_search, we execute it locally (DDGS) and re-call the model
+once for synthesis. search_fn is injected at construction so Reasoner stays
+decoupled from the tool registry.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from assistant_core.fast_path import FastPathResult, try_fast_path
 
 if TYPE_CHECKING:
-    from assistant_core.agent_loop import AgentLoop
     from assistant_core.personality import Personality
-    from llm_router.groq_provider import GroqProvider
     from llm_router.protocol import LocalChatProvider
     from memory.behavioral.query import BehavioralQuery
     from memory.vector.client import VectorMemoryClient
@@ -28,16 +29,6 @@ if TYPE_CHECKING:
     from tools._base import ToolMeta
 
 logger = logging.getLogger(__name__)
-
-_DEEP_TRIGGERS = re.compile(
-    r"\b(explain\s+\w|why do you|what do you think|tell me about\s+\w"
-    r"|help me understand|how does\s+\w|what happened|analyze\s+\w|compare\s+\w)\b",
-    re.IGNORECASE,
-)
-
-_ESCALATE_TURN_THRESHOLD = 8
-
-_CLOUD_ONLY_TOOLS = {"web_search", "web_browse", "weather", "manage_todos"}
 
 
 class ReasonerAction(Enum):
@@ -65,23 +56,27 @@ class Reasoner:
         llm: LocalChatProvider,
         preferences: PreferencesMemory,
         session_store: SessionStore,
-        groq: GroqProvider | None = None,
-        agent_loop: AgentLoop | None = None,
+        synthesis_tools: dict[str, Callable[[dict], Awaitable[str]]] | None = None,
         behavioral_query: BehavioralQuery | None = None,
         vector_client: VectorMemoryClient | None = None,
+        # Kept for backwards-compat — silently ignored.
+        groq: Any = None,
+        agent_loop: Any = None,
+        search_fn: Any = None,
     ) -> None:
         self._personality = personality
         self._llm = llm
         self._preferences = preferences
         self._session_store = session_store
-        self._groq = groq
-        self._agent_loop = agent_loop
+        # synthesis_tools: {tool_name: async fn(params) -> str}
+        # Tools whose raw output should be fed back to the LLM for a spoken synthesis response.
+        # Examples: web_search (DDGS results), terminal_command (ls/find output).
+        self._synthesis_tools: dict[str, Callable[[dict], Awaitable[str]]] = synthesis_tools or {}
         self._behavioral_query = behavioral_query
         self._vector_client = vector_client
         self._conversations: dict[str, list[dict[str, str]]] = {}
         self._session_tools: dict[str, list[str]] = {}
-        self._cached_prompts: dict[str, str] = {}
-        self._cached_fast_prompt: str | None = None
+        self._cached_system_prompt: str | None = None  # single prompt, not per-session
         self._media_playing = False
 
     def set_media_playing(self, playing: bool) -> None:
@@ -126,49 +121,68 @@ class Reasoner:
                 tier=0,
             )
 
-        # --- Prepare conversation history ---
+        # --- Tier 2: single local LLM handles everything ---
         if session_id not in self._conversations:
             self._conversations[session_id] = []
 
         history = self._conversations[session_id]
         history.append({"role": "user", "content": resolved})
 
-        # --- Decide: Tier 2 (fast) or Tier 3 (deep) ---
-        use_deep = self._should_use_deep_model(resolved, session_id)
+        # Build (or reuse) the system prompt. Invalidated externally via invalidate_prompt_cache().
+        if self._cached_system_prompt is None:
+            self._cached_system_prompt = await self._personality.build_system_prompt(tool_metas)
+        system_prompt = self._with_tone(self._cached_system_prompt, tone_hint)
 
-        if use_deep:
-            return await self._run_tier3(
-                resolved, session_id, tool_metas, history, tone_hint=tone_hint,
-            )
-
-        # --- Tier 2: fast model (exclude cloud-only tools) ---
-        tier2_metas = [t for t in tool_metas if t.name not in _CLOUD_ONLY_TOOLS]
-        if self._cached_fast_prompt is None:
-            self._cached_fast_prompt = await self._personality.build_fast_prompt(tier2_metas)
-        system_prompt = self._with_tone(self._cached_fast_prompt, tone_hint)
-        model = self._llm.fast_model
-
-        raw = await self._llm.chat(system_prompt, history, model_override=model)
+        raw = await self._llm.chat(system_prompt, history)
         if not raw:
-            return ReasonerResponse(
-                action=ReasonerAction.SPEAK,
-                message="Sorry, something went wrong.",
-            )
+            return ReasonerResponse(action=ReasonerAction.SPEAK, message="Sorry, something went wrong.")
 
         response = self._parse(raw, session_id)
         response.tier = 2
 
-        # --- Tier 2 → Tier 3 escalation ---
-        # Escalate if: explicit escalate, OR speak (Tier 2 should never speak — all conversation goes to Tier 3)
-        if self._needs_escalation(response, raw) or response.action == ReasonerAction.SPEAK:
-            logger.info("Tier 2 → Tier 3 escalation (action=%s)", response.action.name)
-            return await self._run_tier3(
-                resolved, session_id, tool_metas, history, tone_hint=tone_hint,
+        # --- Synthesis tool loop ---
+        # For tools that return raw data (search results, terminal output, etc.),
+        # execute them locally, inject the result, re-call the LLM once for a
+        # spoken synthesis. One round-trip max — no recursion risk on a 3b model.
+        tool_name = response.tool_name or ""
+        if (
+            response.action in (ReasonerAction.EXECUTE, ReasonerAction.SPEAK_AND_EXECUTE)
+            and tool_name in self._synthesis_tools
+        ):
+            synthesis_fn = self._synthesis_tools[tool_name]
+            logger.info("Synthesis loop: tool=%s params=%s", tool_name, response.params)
+            try:
+                raw_result = await synthesis_fn(response.params)
+            except Exception:
+                logger.exception("Synthesis tool %r failed", tool_name)
+                raw_result = f"Tool '{tool_name}' failed."
+
+            self._session_tools.setdefault(session_id, []).append(tool_name)
+            history.append({"role": "assistant", "content": raw})
+            history.append({
+                "role": "system",
+                "content": (
+                    f"Result from {tool_name}:\n{raw_result}\n\n"
+                    "Using only the above result, give a concise spoken answer to the user's question. "
+                    "Do not make up information not present in the result."
+                ),
+            })
+
+            synthesis_raw = await self._llm.chat(system_prompt, history)
+            if synthesis_raw:
+                history.append({"role": "assistant", "content": synthesis_raw})
+                synthesis = self._parse(synthesis_raw, session_id)
+                synthesis.tier = 2
+                logger.info("Synthesis response (%s): '%s'", tool_name, synthesis.message[:80])
+                return synthesis
+
+            return ReasonerResponse(
+                action=ReasonerAction.SPEAK,
+                message="I got the results but had trouble summarising them.",
+                tier=2,
             )
 
-        logger.info("Tier 2 (%s): action=%s tool=%s",
-                     model, response.action.name, response.tool_name)
-
+        logger.info("Tier 2 (%s): action=%s tool=%s", self._llm.fast_model, response.action.name, response.tool_name)
         history.append({"role": "assistant", "content": raw})
         return response
 
@@ -178,83 +192,13 @@ class Reasoner:
             return system_prompt
         return f"{system_prompt}\n\nTone for this reply: {tone_hint}"
 
-    async def _run_tier3(
-        self,
-        transcript: str,
-        session_id: str,
-        tool_metas: list[ToolMeta],
-        history: list[dict[str, str]],
-        *,
-        tone_hint: str | None = None,
-    ) -> ReasonerResponse:
-        """Tier 3: Cloud agent loop (Groq) or local deep fallback."""
-        if self._groq and self._groq.healthy and self._agent_loop:
-            try:
-                cloud_prompt = await self._personality.build_cloud_prompt(
-                    tool_metas, transcript,
-                    behavioral_query=self._behavioral_query,
-                    vector_client=self._vector_client,
-                )
-                if tone_hint:
-                    cloud_prompt = f"{cloud_prompt}\n\nTone: {tone_hint}"
-                agent_result = await self._agent_loop.run(cloud_prompt, history)
+    def invalidate_prompt_cache(self) -> None:
+        """Force rebuild of the system prompt on the next process() call.
 
-                for tool_name in agent_result.tools_used:
-                    self._session_tools.setdefault(session_id, []).append(tool_name)
-
-                history.append({"role": "assistant", "content": agent_result.message})
-                logger.info("Tier 3 (cloud): msg='%s' tools=%s",
-                            agent_result.message[:80], agent_result.tools_used)
-
-                return ReasonerResponse(
-                    action=ReasonerAction.SPEAK,
-                    message=agent_result.message,
-                    tier=3,
-                    interim_messages=agent_result.interim_messages,
-                )
-            except Exception:
-                logger.exception("Cloud agent loop failed, falling back to local")
-
-        # Fallback: local deep model
-        if session_id not in self._cached_prompts:
-            self._cached_prompts[session_id] = await self._personality.build_system_prompt(
-                tool_metas,
-            )
-        deep_prompt = self._with_tone(self._cached_prompts[session_id], tone_hint)
-        raw = await self._llm.chat(deep_prompt, history, model_override=self._llm.deep_model)
-        if raw:
-            response = self._parse(raw, session_id)
-            response.tier = 3
-            history.append({"role": "assistant", "content": raw})
-            logger.info("Tier 3 (local fallback): action=%s tool=%s",
-                         response.action.name, response.tool_name)
-            return response
-
-        return ReasonerResponse(
-            action=ReasonerAction.SPEAK,
-            message="I'm having trouble right now. Let me try again later.",
-            tier=3,
-        )
-
-    def _should_use_deep_model(self, transcript: str, session_id: str) -> bool:
-        if _DEEP_TRIGGERS.search(transcript):
-            return True
-
-        turn_count = len(self._conversations.get(session_id, []))
-        if turn_count >= _ESCALATE_TURN_THRESHOLD:
-            return True
-
-        return False
-
-    def _needs_escalation(self, response: ReasonerResponse, raw: str) -> bool:
-        try:
-            cleaned = self._extract_json(raw)
-            data = json.loads(cleaned)
-            if str(data.get("action", "")).lower() == "escalate":
-                return True
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
-        return False
+        Call this whenever context changes (active app switch, new session context, etc.)
+        so the model gets an up-to-date environment snapshot.
+        """
+        self._cached_system_prompt = None
 
     def inject_tool_result(self, session_id: str, tool_name: str, result_text: str) -> None:
         if session_id in self._conversations:
@@ -266,7 +210,8 @@ class Reasoner:
     def clear_session(self, session_id: str) -> None:
         self._conversations.pop(session_id, None)
         self._session_tools.pop(session_id, None)
-        self._cached_prompts.pop(session_id, None)
+        # Note: _cached_system_prompt is shared across sessions (not per-session).
+        # Use invalidate_prompt_cache() explicitly if you want to force a rebuild.
 
     def get_session_tools(self, session_id: str) -> list[str]:
         return self._session_tools.get(session_id, [])

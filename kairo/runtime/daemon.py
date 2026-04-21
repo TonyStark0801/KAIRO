@@ -133,6 +133,8 @@ class KairoDaemon:
         self._speech_lock = asyncio.Lock()
         self._media_playing = False
         self._saved_volume: int | None = None
+        # Last code block stripped from TTS — consumed by write_file synthesis
+        self._last_code_block: str | None = None
 
     # ------------------------------------------------------------------
     # Startup
@@ -150,7 +152,6 @@ class KairoDaemon:
         await self._init_stt()
         await self._init_tools()
         await self._init_llm()
-        await self._init_groq()
         await self._init_brain()
         await self._init_proactive()
         await self._init_sensors()
@@ -320,15 +321,78 @@ class KairoDaemon:
         )
         self._planner = DialoguePlanner()
 
-        if self._groq and self._groq.healthy and self._tool_registry and self._adapter:
-            self._agent_loop = AgentLoop(self._groq, self._tool_registry, self._adapter)
-            logger.info("Agent loop ready (Groq + tool calling)")
+        # Wire synthesis tools: tools whose raw output is fed back to the LLM
+        # for a spoken synthesis response. Each entry is: tool_name → async fn(params) → str.
+        synthesis_tools: dict = {}
+
+        if self._tool_registry:
+            # web_search — DDGS results → LLM synthesises a spoken answer
+            web_search_tool = self._tool_registry.get("web_search")
+            if web_search_tool is not None:
+                async def _web_search_fn(params: dict) -> str:
+                    try:
+                        query = params.get("query", "")
+                        results = await web_search_tool._run_search(query)
+                        lines = []
+                        for i, r in enumerate(results, start=1):
+                            title = str(r.get("title", "") or "")
+                            snippet = str(r.get("body", "") or r.get("snippet", "") or "")
+                            lines.append(f"{i}. {title} — {snippet}")
+                        return "\n".join(lines) if lines else "No results found."
+                    except Exception:
+                        return "Search unavailable."
+                synthesis_tools["web_search"] = _web_search_fn
+                logger.info("web_search wired into Reasoner synthesis loop")
+
+            # terminal_command — shell stdout → LLM synthesises a spoken answer
+            terminal_tool = self._tool_registry.get("terminal_command")
+            if terminal_tool is not None:
+                async def _terminal_fn(params: dict) -> str:
+                    try:
+                        result = await terminal_tool.execute(params, self._adapter)
+                        return result.message
+                    except Exception:
+                        return "Terminal command failed."
+                synthesis_tools["terminal_command"] = _terminal_fn
+                logger.info("terminal_command wired into Reasoner synthesis loop")
+
+            # write_file — writes file using cached code block or provided content,
+            # returns a short result string for LLM to synthesise into spoken confirmation.
+            # Using a synthesis closure here (not direct tool dispatch) so we can inject
+            # self._last_code_block when the 3b model doesn't embed full code in params.
+            if self._tool_registry.get("write_file") is not None:
+                async def _write_file_fn(params: dict) -> str:
+                    from pathlib import Path as _Path
+                    raw_path = (params.get("path") or "~/Desktop/solution.txt").strip()
+                    # Model may not embed full code — fall back to cached block
+                    content = (params.get("content") or "").strip() or self._last_code_block
+                    if not content:
+                        return (
+                            "No code cached. Ask me to generate the solution first, "
+                            "then say 'write to file'."
+                        )
+                    path = _Path(raw_path.replace("~", str(_Path.home()))).expanduser().resolve()
+                    _BLOCKED = ("/etc", "/usr", "/bin", "/sbin", "/System", "/Library/System")
+                    for fp in _BLOCKED:
+                        if str(path).startswith(fp):
+                            return f"Writing to {fp} is not allowed."
+                    try:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(content, encoding="utf-8")
+                        lines = len(content.splitlines())
+                        self._last_code_block = None  # consumed
+                        logger.info("write_file synthesis: %d lines → %s", lines, path)
+                        return f"Wrote {lines} lines to {path.name} at {path}."
+                    except Exception as e:
+                        logger.exception("write_file synthesis failed: %s", path)
+                        return f"Failed to write the file: {e}"
+                synthesis_tools["write_file"] = _write_file_fn
+                logger.info("write_file wired into Reasoner synthesis loop")
 
         self._reasoner = Reasoner(
             self._personality, self._llm,
             self._preferences, self._session_store,
-            groq=self._groq,
-            agent_loop=self._agent_loop,
+            synthesis_tools=synthesis_tools,
             behavioral_query=self._behavioral_query,
             vector_client=self._vector_client,
         )
@@ -468,6 +532,16 @@ class KairoDaemon:
             logger.info("User interrupted speech")
             if self._voice:
                 self._voice.stop_speaking()
+            # If media was playing when interrupted, keep _media_playing=True so
+            # the mic threshold stays at _ENERGY_MEDIA (1500) after the interrupt.
+            # Without this, session → SLEEP → _set_media_state(False) → threshold
+            # drops to 700 and every song lyric floods the wake-word capture loop.
+            if self._media_playing:
+                logger.info("Interrupt during media — preserving media state, scheduling YouTube pause")
+                if self._loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self._pause_youtube_after_interrupt(), self._loop
+                    )
 
         self._mic.set_interrupt_callback(_on_interrupt)
         self._executor_pool.submit(self._mic.run, self._stop_event)
@@ -614,11 +688,67 @@ class KairoDaemon:
     # Speech — mutes mic during output
     # ------------------------------------------------------------------
 
+    def _sanitize_for_speech(self, text: str) -> str:
+        """Strip markdown formatting that TTS would read literally.
+
+        Also strips triple-backtick code fences — replaces them with a short spoken
+        notice and caches the extracted code in self._last_code_block so the user
+        can say 'write to file' to save it.
+
+        Called before every speak() so the user never hears raw code or markdown.
+        """
+        import re
+        t = text
+
+        # --- Strip multi-line code fences (``` ... ```) ---
+        # Must run before inline-backtick strip to avoid partial matches.
+        code_blocks: list[str] = []
+
+        def _capture_code(m: re.Match) -> str:
+            block = m.group(1).strip()
+            if block:
+                code_blocks.append(block)
+            return "I have a code solution — say 'write to file' to save it."
+
+        t = re.sub(r"```[\w+\-#]*\n?(.*?)```", _capture_code, t, flags=re.DOTALL)
+
+        if code_blocks:
+            self._last_code_block = "\n\n".join(code_blocks)
+            logger.info(
+                "Stripped code block from speech output and cached (%d chars)",
+                len(self._last_code_block),
+            )
+
+        # Remove bold/italic markers: **word** → word, *word* → word
+        t = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", t)
+        # Remove markdown headers: ## Title → Title
+        t = re.sub(r"^#{1,6}\s+", "", t, flags=re.MULTILINE)
+        # Remove bullet point markers (- item, * item, • item)
+        t = re.sub(r"^\s*[-*•]\s+", "", t, flags=re.MULTILINE)
+        # Remove numbered list markers: "1. " → ""
+        t = re.sub(r"^\s*\d+\.\s+", "", t, flags=re.MULTILINE)
+        # Remove inline code backticks: `code` → code
+        t = re.sub(r"`([^`]+)`", r"\1", t)
+        # Collapse multiple blank lines to one
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
     async def _speak(self, text: str) -> None:
         if not text or not self._voice:
             return
+        clean = self._sanitize_for_speech(text)
+        if not clean:
+            return
         async with self._speech_lock:
-            await self._voice.speak(text)
+            # Raise mic threshold before speaking so earphone bleed doesn't trigger
+            # ghost commands. set_speaking(False) restores normal threshold after.
+            if self._mic is not None:
+                self._mic.set_speaking(True)
+            try:
+                await self._voice.speak(clean)
+            finally:
+                if self._mic is not None:
+                    self._mic.set_speaking(False)
 
     # ------------------------------------------------------------------
     # Tool execution result — media state + selective speech
@@ -776,6 +906,33 @@ class KairoDaemon:
         except Exception:
             logger.debug("System volume restore failed")
 
+    async def _pause_youtube_after_interrupt(self) -> None:
+        """Pause YouTube after an interrupt during media playback.
+
+        When the user says 'stop' / 'stop the music', the interrupt fires
+        synchronously (stops TTS) but YouTube keeps playing. This coroutine
+        dispatches a youtube_control pause after a brief settle so the media
+        state is consistent and the mic threshold stays elevated.
+        """
+        await asyncio.sleep(0.3)
+        if not self._tool_registry:
+            return
+        yt_tool = self._tool_registry.get("youtube_control")
+        if yt_tool is None:
+            return
+        try:
+            params = {
+                "action": "pause",
+                "_config": self._config.model_dump(),
+                "_executor": self._tool_executor,
+            }
+            result = await yt_tool.execute(params, self._adapter)
+            logger.info("YouTube paused after interrupt: %s", result.message)
+            # Update media state only after confirmed pause
+            self._set_media_state(False)
+        except Exception:
+            logger.exception("Failed to pause YouTube after interrupt")
+
     # ------------------------------------------------------------------
     # Phase 2 — context + clipboard handlers
     # ------------------------------------------------------------------
@@ -788,11 +945,10 @@ class KairoDaemon:
             event.activity_type.name,
             event.browser_url[:60] if event.browser_url else "",
         )
-        # Clear the cached fast + deep system prompts so next Reasoner call
+        # Invalidate the cached system prompt so next Reasoner call
         # picks up the updated workspace context via Personality.
         if self._reasoner:
-            self._reasoner._cached_fast_prompt = None
-            self._reasoner._cached_prompts.clear()
+            self._reasoner.invalidate_prompt_cache()
 
     async def _on_clipboard_changed(self, event) -> None:
         logger.debug(
@@ -894,6 +1050,8 @@ class KairoDaemon:
             await self._session_store.close()
         if self._todo_store:
             await self._todo_store.close()
+        if self._llm and hasattr(self._llm, "close"):
+            await self._llm.close()
         logger.info("Kairo daemon stopped")
 
 
