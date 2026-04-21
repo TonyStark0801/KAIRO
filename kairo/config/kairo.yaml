@@ -1,8 +1,8 @@
 ollama:
   host: localhost
   port: 11434
-  model: qwen2.5:3b
-  fast_model: qwen2.5:3b
+  model: qwen2.5:7b
+  fast_model: qwen2.5:7b
   embed_model: nomic-embed-text
 
 stt:
@@ -24,10 +24,21 @@ mic:
   sd_show_meter: false
 
 wake:
-  engine: stt_keyword
-  openwakeword_models: []
-  openwakeword_threshold: 0.5
+  # Two-stage pipeline:
+  #   Stage 1 — openWakeWord neural detector (frame-by-frame, <1ms, always running)
+  #             Uses alexa/hey_mycroft as acoustic proxy for "hey kairo" — similar
+  #             two-syllable pattern. Low threshold (0.3) for high recall; Stage 2 rejects FPs.
+  #   Stage 2 — Whisper confirmation on the 1.5s audio buffer captured by OWW.
+  #             Only fires the wake event if "kairo" (or variant) is heard.
+  #             Cuts false positives from ambient speech, TV, room conversation.
+  #
+  # Fallback: set engine: stt_keyword if openwakeword install fails.
+  engine: openwakeword
+  openwakeword_models: []       # empty = use bundled default models (alexa, hey_mycroft, etc.)
+  openwakeword_threshold: 0.5   # balanced — enough recall for "hey kairo", Stage 2 still rejects FPs
   openwakeword_inference_framework: tflite
+  # Stage 2 Whisper confirmation — set false to disable and trust OWW alone
+  oww_whisper_verify: true
 
 session:
   idle_timeout: 45
@@ -67,6 +78,17 @@ groq:
   model: llama-3.3-70b-versatile
   max_tokens: 1024
   temperature: 0.7
+
+search:
+  # SearxNG: primary workhorse for raw web results. Self-hosted, free, unlimited.
+  #   docker run -d -p 8888:8080 --name searxng searxng/searxng
+  # (8888 host → 8080 container to avoid clashing with common 8080 apps)
+  searxng_url: http://localhost:8888
+  # Tavily: used by deep_search for synthesis queries ("what is X", latest news, fact-checks).
+  # Free tier: 1000 req/month. Get key at https://tavily.com, set TAVILY_API_KEY env var.
+  tavily_api_key_env: TAVILY_API_KEY
+  # DDG: last-resort fallback if both above fail (offline / docker down / no Tavily key).
+  enable_ddg_fallback: true
 
 proactive:
   enabled: true

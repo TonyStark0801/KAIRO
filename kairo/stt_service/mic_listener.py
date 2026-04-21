@@ -54,6 +54,7 @@ class MicListener:
         voice_verifier: VoiceVerifier | None = None,
         openwakeword_detector: OpenWakeWordStreamDetector | None = None,
         wake_stt_engine: STTEngine | None = None,
+        oww_whisper_verify: bool = True,
     ) -> None:
         # Two engines: tiny/fast for wake-word matching, full for commands.
         # If wake_stt_engine is None we fall back to stt_engine (single-model mode).
@@ -62,6 +63,9 @@ class MicListener:
         self._bus = event_bus
         self._loop = loop
         self._oww_detector = openwakeword_detector
+        # Stage 2 Whisper verification after OWW Stage 1 fires.
+        # Uses wake_stt_engine (small.en) to confirm "kairo" was in the audio.
+        self._oww_whisper_verify = oww_whisper_verify
         self._wake_words = wake_words or [
             # Canonical
             "kairo", "hey kairo",
@@ -174,7 +178,17 @@ class MicListener:
                         time.sleep(0.02)
                         continue
                     if self._oww_detector.feed_pcm_frame(oww_frame):
-                        self._publish_openwakeword_wake()
+                        # Stage 1 fired — run Stage 2 Whisper verification before publishing.
+                        # verify_with_whisper() uses the ring buffer (~1.5s) captured by OWW.
+                        # Runs synchronously in the mic thread (wake_stt = small.en, ~200ms on M1).
+                        if self._oww_whisper_verify:
+                            confirmed = self._oww_detector.verify_with_whisper(self._wake_stt)
+                            if confirmed:
+                                self._publish_openwakeword_wake()
+                            # else: OWW false positive — drop silently, already logged in verify_with_whisper
+                        else:
+                            # Stage 2 disabled — trust OWW alone
+                            self._publish_openwakeword_wake()
                     continue
 
                 try:

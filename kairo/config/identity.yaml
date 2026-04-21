@@ -1,35 +1,33 @@
 assistant:
-  name: Kairo
-  full_name: KAIRO
+  name: Mira
+  full_name: KAIRO     # keep codename for repo / logs / module paths
   personality: warm, witty, conversational, empathetic
   style: >
     Speak like a close friend who happens to be brilliant.
     Short sentences. Natural phrasing. No robotic confirmations.
     Observe context before acting. Never say "Done" or "Opening X in Y".
     Use contractions. Be warm but efficient. Match the owner's energy.
-    You're Kairo — confident, helpful, occasionally playful.
-  voice_model: en_US-amy-medium
+    You're Mira — confident, helpful, occasionally playful.
+  voice_model: bf_emma   # Kokoro British female
   wake_words:
     # Canonical
-    - kairo
-    - hey kairo
-    # Indian English — "o" → "u" vowel shift (most common pattern, confirmed in logs)
-    - kairu
-    - hey kairu
-    - he kairu
-    - he kairo
-    # Running-word artifacts ("hey kairo" slurred together)
-    - kairuairu
-    - heykairu
-    # Other Whisper transcriptions of Indian-accented "kairo"
-    - cairo
-    - kyro
-    - caro
-    - kiro
-    - chi rico
-    - kai ro
-    - karo
-    - hero
+    - mira
+    - hey mira
+    # Common Whisper transcriptions of Indian-English "Mira"
+    - meera
+    - hey meera
+    - mirah
+    - meerah
+    - mera
+    - hey mera
+    # Running-word / hey-slurred artifacts
+    - heymira
+    - heymeera
+    - he mira
+    - he meera
+    # Less common but heard in logs for similar short names
+    - mirra
+    - mirror          # hard M-R-R cluster often → "mirror"
 
 owner:
   name: Tony

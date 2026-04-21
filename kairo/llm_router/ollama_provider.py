@@ -13,9 +13,9 @@ from llm_router.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
-# 10 turns = 20 messages (user + assistant pairs). Enough context without
-# hammering RAM. Older turns are already summarized into session memory.
-_MAX_HISTORY = 10
+# 6 turns = 12 messages (user + assistant pairs). Voice conversations rarely
+# need more than a few turns of context; older turns live in session memory.
+_MAX_HISTORY = 6
 
 
 class OllamaProvider(LLMProvider):
@@ -82,7 +82,7 @@ class OllamaProvider(LLMProvider):
             await self._client.chat(
                 model=self._model,
                 messages=[{"role": "user", "content": "hi"}],
-                options={"num_predict": 1},
+                options={"num_predict": 1, "num_ctx": 4096},
                 keep_alive="5m",
             )
             logger.info("Warmed up model: %s", self._model)
@@ -110,6 +110,11 @@ class OllamaProvider(LLMProvider):
                 model=model,
                 messages=full_messages,
                 keep_alive="5m",
+                options={
+                    "num_ctx": 4096,      # cap KV cache — 7b default is huge and slow
+                    "num_predict": 220,   # voice replies are short; cap avoids runaway generation
+                    "temperature": 0.1,   # near-deterministic: faster sampling, consistent tool JSON
+                },
             )
             return response["message"]["content"]
         except Exception:

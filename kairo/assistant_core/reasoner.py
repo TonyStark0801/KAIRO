@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
@@ -325,6 +326,10 @@ class Reasoner:
                     pass
         return data
 
+    # Valid JSON string escapes per RFC 8259. Anything else (e.g. \., \*) is invalid
+    # and crashes json.loads — models sometimes emit these when they think shell regex.
+    _BAD_ESCAPE_RE = re.compile(r'\\([^"\\/bfnrtu])')
+
     @staticmethod
     def _extract_json(text: str) -> str:
         text = text.strip()
@@ -342,4 +347,6 @@ class Reasoner:
         end = text.rfind("}")
         if end == -1:
             return text
-        return text[start:end + 1]
+        extracted = text[start:end + 1]
+        # Drop invalid backslash escapes (e.g. \. \* from regex-minded models).
+        return Reasoner._BAD_ESCAPE_RE.sub(r"\1", extracted)

@@ -326,23 +326,29 @@ class KairoDaemon:
         synthesis_tools: dict = {}
 
         if self._tool_registry:
-            # web_search — DDGS results → LLM synthesises a spoken answer
+            # web_search — SearxNG (primary) / DDG (fallback) → LLM synthesises a spoken answer
             web_search_tool = self._tool_registry.get("web_search")
             if web_search_tool is not None:
                 async def _web_search_fn(params: dict) -> str:
                     try:
-                        query = params.get("query", "")
-                        results = await web_search_tool._run_search(query)
-                        lines = []
-                        for i, r in enumerate(results, start=1):
-                            title = str(r.get("title", "") or "")
-                            snippet = str(r.get("body", "") or r.get("snippet", "") or "")
-                            lines.append(f"{i}. {title} — {snippet}")
-                        return "\n".join(lines) if lines else "No results found."
+                        result = await web_search_tool.execute(params, self._adapter)
+                        return result.message or "No results found."
                     except Exception:
                         return "Search unavailable."
                 synthesis_tools["web_search"] = _web_search_fn
                 logger.info("web_search wired into Reasoner synthesis loop")
+
+            # deep_search — Tavily returns a synthesized answer directly; LLM just reads it back
+            deep_search_tool = self._tool_registry.get("deep_search")
+            if deep_search_tool is not None:
+                async def _deep_search_fn(params: dict) -> str:
+                    try:
+                        result = await deep_search_tool.execute(params, self._adapter)
+                        return result.message or "No answer found."
+                    except Exception:
+                        return "Deep search unavailable."
+                synthesis_tools["deep_search"] = _deep_search_fn
+                logger.info("deep_search wired into Reasoner synthesis loop")
 
             # terminal_command — shell stdout → LLM synthesises a spoken answer
             terminal_tool = self._tool_registry.get("terminal_command")
@@ -388,6 +394,22 @@ class KairoDaemon:
                         return f"Failed to write the file: {e}"
                 synthesis_tools["write_file"] = _write_file_fn
                 logger.info("write_file wired into Reasoner synthesis loop")
+
+            # find_folder — fuzzy folder search → LLM decides (use top hit, confirm, or no-match)
+            find_folder_tool = self._tool_registry.get("find_folder")
+            if find_folder_tool is not None:
+                async def _find_folder_fn(params: dict) -> str:
+                    try:
+                        result = await find_folder_tool.execute(params, self._adapter)
+                        matches = result.data.get("matches", []) if result.data else []
+                        if not matches:
+                            return "No folders found."
+                        lines = [f"{m['name']} | {m['path']} | score={m['score']}" for m in matches]
+                        return "matches:\n" + "\n".join(lines)
+                    except Exception:
+                        return "find_folder failed."
+                synthesis_tools["find_folder"] = _find_folder_fn
+                logger.info("find_folder wired into Reasoner synthesis loop")
 
         self._reasoner = Reasoner(
             self._personality, self._llm,
@@ -527,6 +549,7 @@ class KairoDaemon:
                 voice_verifier=self._voice_verifier,
                 openwakeword_detector=oww,
                 wake_stt_engine=self._wake_stt,
+                oww_whisper_verify=self._config.wake.oww_whisper_verify,
             )
         def _on_interrupt():
             logger.info("User interrupted speech")

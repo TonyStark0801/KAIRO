@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -54,6 +55,9 @@ class Personality:
         # Full datetime string so the model can answer "what's the date" without guessing.
         current_datetime = now.strftime("%A, %B %d %Y, %I:%M %p")  # e.g. "Tuesday, April 21 2026, 02:08 AM"
 
+        posix_user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        home_path = str(Path.home())
+
         template = self._jinja.get_template("system.j2")
         return template.render(
             assistant_name=self._identity.assistant_name,
@@ -62,6 +66,8 @@ class Personality:
             current_datetime=current_datetime,
             tools_list=tools_list,
             recent_commands=recent_commands or [],
+            posix_user=posix_user,
+            home_path=home_path,
         )
 
     async def build_fast_prompt(self, tool_metas: list[ToolMeta]) -> str:

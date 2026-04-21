@@ -1,14 +1,35 @@
-"""Tool: DuckDuckGo web search."""
+"""Tool: web search — SearxNG primary, DDG fallback.
+
+SearxNG: self-hosted meta-search aggregator (Google/Bing/DDG etc.).
+  docker run -d -p 8888:8080 --name searxng searxng/searxng
+Free, unlimited, no API key. Used for most voice queries.
+DDG: last-resort fallback if SearxNG is down.
+
+For synthesis-style queries (where you want a direct answer, not snippets), use deep_search (Tavily).
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
+
+import yaml
 
 from adapters.base.platform_adapter import PlatformAdapter
 from tools._base import BaseTool, ToolResult
 
 logger = logging.getLogger(__name__)
+
+_CONFIG_PATH = os.path.expanduser("~/Jarvis/kairo/config/kairo.yaml")
+
+
+def _load_search_config() -> dict[str, Any]:
+    try:
+        with open(_CONFIG_PATH) as f:
+            return (yaml.safe_load(f) or {}).get("search", {})
+    except Exception:
+        return {}
 
 
 class WebSearchTool(BaseTool):
@@ -18,7 +39,7 @@ class WebSearchTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Search the web using DuckDuckGo. Returns top results with titles and snippets."
+        return "Search the web for general information. Returns ranked snippets that you must synthesize. Use for news, reference lookups, how-to, factual queries."
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
@@ -37,11 +58,27 @@ class WebSearchTool(BaseTool):
         if not query:
             return ToolResult(success=False, message="No search query provided")
 
-        try:
-            results = await self._run_search(query)
-        except Exception as e:
-            logger.exception("web_search failed for query=%r", query)
-            return ToolResult(success=False, message=f"Search failed: {e}")
+        cfg = _load_search_config()
+        results: list[dict[str, Any]] = []
+
+        # Tier 1: SearxNG
+        searxng_url = cfg.get("searxng_url")
+        if searxng_url:
+            try:
+                results = await self._searxng(searxng_url, query)
+                if results:
+                    logger.info("web_search via SearxNG: %d results", len(results))
+            except Exception:
+                logger.exception("SearxNG search failed, falling back to DDG")
+
+        # Tier 2: DDG fallback
+        if not results and cfg.get("enable_ddg_fallback", True):
+            try:
+                results = await self._ddg(query)
+                if results:
+                    logger.info("web_search via DDG fallback: %d results", len(results))
+            except Exception:
+                logger.exception("DDG fallback also failed")
 
         if not results:
             return ToolResult(
@@ -51,23 +88,34 @@ class WebSearchTool(BaseTool):
             )
 
         lines: list[str] = []
-        for i, r in enumerate(results, start=1):
-            title = str(r.get("title", "") or "")
-            snippet = str(
-                r.get("body", "") or r.get("snippet", "") or ""
-            )
-            url = str(r.get("href", "") or r.get("url", "") or "")
+        for i, r in enumerate(results[:5], start=1):
+            title = str(r.get("title") or "")
+            snippet = str(r.get("body") or r.get("snippet") or r.get("content") or "")
+            url = str(r.get("href") or r.get("url") or "")
             lines.append(f"{i}. {title}\n   {snippet}\n   {url}")
-        formatted = "\n\n".join(lines)
 
         return ToolResult(
             success=True,
-            message=formatted,
+            message="\n\n".join(lines),
             data={"speak_result": False},
         )
 
-    async def _run_search(self, query: str) -> list[dict[str, Any]]:
-        """Search via ddgs (new package name) or duckduckgo_search (legacy)."""
+    @staticmethod
+    async def _searxng(base_url: str, query: str) -> list[dict[str, Any]]:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.get(
+                f"{base_url.rstrip('/')}/search",
+                params={"q": query, "format": "json", "safesearch": "0"},
+                headers={"User-Agent": "KAIRO/1.0"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return data.get("results", []) or []
+
+    @staticmethod
+    async def _ddg(query: str) -> list[dict[str, Any]]:
         try:
             from ddgs import DDGS
         except ImportError:

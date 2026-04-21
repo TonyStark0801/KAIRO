@@ -65,12 +65,24 @@ class SttConfig(BaseModel):
 
 
 class WakeConfig(BaseModel):
-    """Wake detection: STT keyword (default) or streaming openWakeWord models."""
+    """Wake detection: STT keyword (default) or streaming openWakeWord models.
+
+    Two-stage pipeline when engine=openwakeword:
+      Stage 1 — OWW neural detector (frame-by-frame, <1ms). Bundled models used
+                as acoustic proxy for "hey kairo" (alexa, hey_mycroft have similar
+                two-syllable cadence). Low threshold for high recall.
+      Stage 2 — Whisper confirmation on the 1.5s audio buffer captured by OWW.
+                Only fires wake event if "kairo" (or phonetic variant) is found.
+                Eliminates false positives from ambient speech, TV, room conversation.
+    """
 
     engine: str = Field(default="stt_keyword", description="stt_keyword | openwakeword")
     openwakeword_models: list[str] = Field(default_factory=list)
-    openwakeword_threshold: float = 0.5
+    openwakeword_threshold: float = 0.3   # lower than default — Stage 2 Whisper rejects FPs
     openwakeword_inference_framework: str = "tflite"
+    # Stage 2: run Whisper on OWW's audio buffer to confirm "kairo" was actually said.
+    # Disable only if you want pure OWW detection (faster, higher FP rate).
+    oww_whisper_verify: bool = True
 
 
 class ProjectEntry(BaseModel):
