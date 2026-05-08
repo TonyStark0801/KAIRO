@@ -13,6 +13,22 @@ stt:
   # mlx-whisper bias — same idea as newThing/test.py (Indian English, coding context).
   initial_prompt: "A software engineer in Mumbai speaking Indian English about coding."
 
+vad:
+  # Silero VAD pre-filter — rejects non-speech audio (TV, music, keyboard,
+  # coughing, clatter) BEFORE it hits Whisper or speaker verification.
+  # Significantly reduces wake-word noise from ambient sources. ~30MB ONNX.
+  enabled: true
+  min_speech_prob: 0.5
+
+speaker_id:
+  enabled: true
+  voiceprint_path: ~/.kairo/voiceprint.npy
+  threshold: 0.20
+  # Reject any audio not matching the enrolled voiceprint. Rejects include:
+  # - Mira's own TTS output (self-echo)
+  # - TV / music / other humans in the room
+  # Disable by setting enabled: false if you haven't enrolled yet.
+
 # Mic: auto = sounddevice if scipy+sounddevice installed (same as newThing), else PyAudio.
 # sounddevice path feeds the daemon agent / reasoner / LLM / TTS unchanged (VoiceTranscriptEvent).
 mic:
@@ -35,13 +51,13 @@ wake:
   # Fallback: set engine: stt_keyword if openwakeword install fails.
   engine: openwakeword
   openwakeword_models: []       # empty = use bundled default models (alexa, hey_mycroft, etc.)
-  openwakeword_threshold: 0.5   # balanced — enough recall for "hey kairo", Stage 2 still rejects FPs
+  openwakeword_threshold: 0.65  # stricter — cuts TV / family / ambient from reaching Stage 2 Whisper
   openwakeword_inference_framework: tflite
   # Stage 2 Whisper confirmation — set false to disable and trust OWW alone
   oww_whisper_verify: true
 
 session:
-  idle_timeout: 45
+  idle_timeout: 90
   wake_window: 10
   tool_timeout: 30
 

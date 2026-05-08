@@ -13,10 +13,15 @@ Two-stage pipeline:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import deque
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from stt_service.speaker_verifier import SpeakerVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -122,11 +127,19 @@ class OpenWakeWordStreamDetector:
 
     # ── Stage 2: Whisper verification ─────────────────────────────────────────
 
-    def verify_with_whisper(self, stt_engine) -> bool:
+    def verify_with_whisper(
+        self,
+        stt_engine,
+        *,
+        speaker_verifier: SpeakerVerifier | None = None,
+        event_loop: asyncio.AbstractEventLoop | None = None,
+    ) -> bool:
         """Run Whisper on the ring buffer audio and confirm "kairo" was said.
 
         Args:
             stt_engine: any STTEngine instance with a .transcribe(float32_array) method.
+            speaker_verifier: optional ECAPA gate — runs after transcript confirms wake.
+            event_loop: asyncio loop for ``speaker_verifier.verify`` (mic thread → main loop).
 
         Returns True if a kairo variant is found in the transcript.
         Logs the transcript regardless — useful for tuning the variant list.
@@ -149,21 +162,50 @@ class OpenWakeWordStreamDetector:
         # Check for kairo variants in the transcript
         # Use word-level matching, not substring — avoids "cairo" in "cairo egypt"
         words = text.replace(",", "").replace(".", "").replace("!", "").replace("?", "").split()
+        transcript_ok = False
         for i in range(len(words)):
             # single-word match: "kairo", "cairo", etc.
             if words[i] in _KAIRO_VARIANTS:
                 logger.info("OWW Stage 2: kairo variant '%s' confirmed in transcript", words[i])
-                return True
+                transcript_ok = True
+                break
             # two-word match: "hey kairo", "hey kairu", etc.
             if i + 1 < len(words):
                 bigram = f"{words[i]} {words[i+1]}"
                 if bigram in _KAIRO_VARIANTS:
                     logger.info("OWW Stage 2: kairo bigram '%s' confirmed in transcript", bigram)
-                    return True
+                    transcript_ok = True
+                    break
 
-        logger.info(
-            "OWW Stage 2: rejected — '%s' contains no kairo variant "
-            "(OWW model=%s was a false positive, score=%.3f)",
-            text, self._last_trigger_model, self._last_trigger_score,
-        )
-        return False
+        if not transcript_ok:
+            logger.info(
+                "OWW Stage 2: rejected — '%s' contains no kairo variant "
+                "(OWW model=%s was a false positive, score=%.3f)",
+                text, self._last_trigger_model, self._last_trigger_score,
+            )
+            return False
+
+        if (
+            speaker_verifier is not None
+            and event_loop is not None
+            and speaker_verifier.is_gating
+        ):
+            audio_bytes = self.recent_audio()
+            if not audio_bytes:
+                return True
+            samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            fut = asyncio.run_coroutine_threadsafe(
+                speaker_verifier.verify(samples, 16000),
+                event_loop,
+            )
+            try:
+                accepted, score = fut.result(timeout=120)
+            except Exception:
+                logger.exception("OWW Stage 2: speaker verify failed — accepting wake")
+                return True
+            if not accepted:
+                logger.info("Rejected wake word (speaker mismatch, score=%.3f)", score)
+                return False
+            logger.debug("OWW Stage 2: speaker verified (score=%.3f)", score)
+
+        return True

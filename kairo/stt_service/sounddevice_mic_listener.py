@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from runtime.event_bus import EventBus
     from sensors.voice.voice_verifier import VoiceVerifier
     from stt_service.base import STTEngine
+    from stt_service.speaker_verifier import SpeakerVerifier
+    from stt_service.vad_filter import SileroVAD
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ class SounddeviceMicListener(MicListener):
         sd_show_meter: bool = False,
         wake_words: list[str] | None = None,
         voice_verifier: VoiceVerifier | None = None,
+        speaker_verifier: SpeakerVerifier | None = None,
+        vad: SileroVAD | None = None,
         openwakeword_detector=None,
         wake_stt_engine: STTEngine | None = None,
     ) -> None:
@@ -52,6 +56,7 @@ class SounddeviceMicListener(MicListener):
             loop,
             wake_words=wake_words,
             voice_verifier=voice_verifier,
+            speaker_verifier=speaker_verifier,
             openwakeword_detector=None,
             wake_stt_engine=wake_stt_engine,
         )
@@ -68,6 +73,7 @@ class SounddeviceMicListener(MicListener):
         self._sd_min_duration_seconds = sd_min_duration_seconds
         self._sd_device = sd_device
         self._sd_show_meter = sd_show_meter
+        self._vad = vad
 
     def run(self, stop_event: threading.Event) -> None:
         err = try_import_deps()
@@ -86,6 +92,9 @@ class SounddeviceMicListener(MicListener):
 
         def on_utterance(audio_f32: np.ndarray) -> None:
             pcm = np.clip(audio_f32, -1.0, 1.0)
+            if self._vad is not None and not self._vad.is_speech(pcm, _SAMPLE_RATE):
+                logger.debug("VAD drop: not speech (%.2fs)", pcm.size / _SAMPLE_RATE)
+                return
             samples_i16 = (pcm * 32767.0).astype(np.int16)
             audio_bytes = samples_i16.tobytes()
             mode = self.mode

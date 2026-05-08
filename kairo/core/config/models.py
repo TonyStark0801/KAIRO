@@ -129,6 +129,26 @@ class ProactiveConfig(BaseModel):
     focus_suggestions: bool = True
 
 
+class VadConfig(BaseModel):
+    """Silero VAD pre-filter — drops non-speech audio before Whisper/verifier."""
+
+    enabled: bool = True
+    min_speech_prob: float = 0.5
+
+
+class SpeakerIdConfig(BaseModel):
+    """Single-speaker ECAPA voiceprint gating (STT / wake paths only)."""
+
+    enabled: bool = True
+    voiceprint_path: str = "~/.kairo/voiceprint.npy"
+    threshold: float = 0.65
+
+    @field_validator("voiceprint_path")
+    @classmethod
+    def expand_voiceprint_path(cls, v: str) -> str:
+        return str(Path(v).expanduser())
+
+
 class MicConfig(BaseModel):
     """Microphone capture for the daemon.
 
@@ -165,6 +185,8 @@ class ObserverConfig(BaseModel):
 class KairoConfig(BaseModel):
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     stt: SttConfig = Field(default_factory=SttConfig)
+    speaker_id: SpeakerIdConfig = Field(default_factory=SpeakerIdConfig)
+    vad: VadConfig = Field(default_factory=VadConfig)
     mic: MicConfig = Field(default_factory=MicConfig)
     wake: WakeConfig = Field(default_factory=WakeConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)

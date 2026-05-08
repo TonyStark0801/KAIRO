@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sensors.voice.voice_verifier import VoiceVerifier
     from sensors.wake.openwakeword_stream import OpenWakeWordStreamDetector
     from stt_service.base import STTEngine
+    from stt_service.speaker_verifier import SpeakerVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class MicListener:
         loop: asyncio.AbstractEventLoop,
         wake_words: list[str] | None = None,
         voice_verifier: VoiceVerifier | None = None,
+        speaker_verifier: SpeakerVerifier | None = None,
         openwakeword_detector: OpenWakeWordStreamDetector | None = None,
         wake_stt_engine: STTEngine | None = None,
         oww_whisper_verify: bool = True,
@@ -78,6 +80,7 @@ class MicListener:
             # These are too common in song lyrics / ambient speech → high false-positive rate
         ]
         self._voice_verifier = voice_verifier
+        self._speaker_verifier = speaker_verifier
         self._mode = MicMode.IDLE
         self._mode_lock = threading.Lock()
         self._session_id = ""
@@ -182,7 +185,11 @@ class MicListener:
                         # verify_with_whisper() uses the ring buffer (~1.5s) captured by OWW.
                         # Runs synchronously in the mic thread (wake_stt = small.en, ~200ms on M1).
                         if self._oww_whisper_verify:
-                            confirmed = self._oww_detector.verify_with_whisper(self._wake_stt)
+                            confirmed = self._oww_detector.verify_with_whisper(
+                                self._wake_stt,
+                                speaker_verifier=self._speaker_verifier,
+                                event_loop=self._loop,
+                            )
                             if confirmed:
                                 self._publish_openwakeword_wake()
                             # else: OWW false positive — drop silently, already logged in verify_with_whisper
@@ -277,6 +284,20 @@ class MicListener:
         samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         return engine.transcribe(samples)
 
+    def _speaker_verify_blocking(self, samples_f32: np.ndarray) -> tuple[bool, float]:
+        """Run ECAPA verify on the asyncio loop from the mic thread."""
+        if self._speaker_verifier is None or not self._speaker_verifier.is_gating:
+            return True, 1.0
+        fut = asyncio.run_coroutine_threadsafe(
+            self._speaker_verifier.verify(samples_f32, _SAMPLE_RATE),
+            self._loop,
+        )
+        try:
+            return fut.result(timeout=120)
+        except Exception:
+            logger.exception("Speaker verify failed — accepting audio")
+            return True, 0.0
+
     def _transcribe_meta(self, audio_bytes: bytes, *, wake: bool = False):
         """Returns TranscriptMeta(text, speech_prob). Use this over _transcribe() when filtering matters."""
         engine = self._wake_stt if wake else self._stt
@@ -330,6 +351,12 @@ class MicListener:
         matched_keyword = self._find_wake_keyword(text_lower)
         if matched_keyword:
             logger.info("Wake word matched: '%s' in '%s'", matched_keyword, text)
+            samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            accepted, score = self._speaker_verify_blocking(samples)
+            if not accepted:
+                logger.info("Rejected wake word (speaker mismatch, score=%.3f)", score)
+                return
+
             from runtime.event_bus import GestureEvent, GestureType
 
             now = time.time()
@@ -454,6 +481,17 @@ class MicListener:
         if looks_like_ambient(text):
             logger.debug("Filtered ambient speech: '%s' (speech_prob=%.2f)", text, meta.speech_prob)
             return
+
+        samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        accepted, score = self._speaker_verify_blocking(samples)
+        if not accepted:
+            logger.info(
+                "Rejected voice command (speaker mismatch, score=%.3f): %r",
+                score,
+                text,
+            )
+            return
+        logger.debug("Speaker verified (score=%.3f): %r", score, text)
 
         logger.info("Voice command: '%s' (speech_prob=%.2f)", text, meta.speech_prob)
 

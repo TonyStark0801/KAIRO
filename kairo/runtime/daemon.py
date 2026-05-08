@@ -50,14 +50,16 @@ from runtime.health import HealthStatus, HealthTracker
 from sensors.voice.voice_verifier import VoiceVerifier
 from sensors.wake.factory import try_create_openwakeword_stream
 from stt_service.mic_listener import MicListener, MicMode
+from stt_service.speaker_verifier import SpeakerVerifier
 from stt_service.sounddevice_mic_listener import SounddeviceMicListener
+from stt_service.vad_filter import SileroVAD
 from stt_service.sounddevice_segmenter import try_import_deps as try_sounddevice_mic_deps
 from stt_service.whisper_engine import WhisperEngine
 from voice_service.piper_engine import PiperVoiceEngine
 
 logger = logging.getLogger("kairo")
 
-_MEDIA_TOOLS = {"youtube_pick", "youtube_playlist"}
+_MEDIA_TOOLS = {"youtube_pick", "youtube_playlist", "youtube_search"}
 _MEDIA_PLAY_ACTIONS = {"play"}
 _MEDIA_PAUSE_ACTIONS = {"pause"}
 _DUCK_LEVEL = 15
@@ -94,6 +96,8 @@ class KairoDaemon:
         # Services
         self._identity: IdentityMemory | None = None
         self._voice_verifier: VoiceVerifier | None = None
+        self._speaker_verifier: SpeakerVerifier | None = None
+        self._vad: SileroVAD | None = None
         self._preferences: PreferencesMemory | None = None
         self._session_store: SessionStore | None = None
         self._context_detector: ContextDetector | None = None
@@ -154,6 +158,8 @@ class KairoDaemon:
         await self._init_llm()
         await self._init_brain()
         await self._init_proactive()
+        await self._init_speaker_verifier()
+        await self._init_vad()
         await self._init_sensors()
         await self._init_fsm()
         await self._wire_subscriptions()
@@ -420,6 +426,27 @@ class KairoDaemon:
         )
         self._health.mark("brain", HealthStatus.HEALTHY)
 
+    async def _init_speaker_verifier(self) -> None:
+        sid = self._config.speaker_id
+        vp = Path(sid.voiceprint_path).expanduser()
+        if not sid.enabled or not vp.is_file():
+            logger.warning(
+                "⚠ Speaker verification DISABLED — run 'python -m stt_service.enroll_voiceprint' "
+                "to enroll your voice."
+            )
+        self._speaker_verifier = SpeakerVerifier(
+            voiceprint_path=vp,
+            threshold=sid.threshold,
+            enabled=sid.enabled,
+        )
+        await self._speaker_verifier.initialize()
+
+    async def _init_vad(self) -> None:
+        vcfg = self._config.vad
+        self._vad = SileroVAD(enabled=vcfg.enabled, min_speech_prob=vcfg.min_speech_prob)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._vad.initialize)
+
     async def _init_proactive(self) -> None:
         if not self._config.proactive.enabled:
             logger.info("Proactive engine disabled by config")
@@ -538,6 +565,8 @@ class KairoDaemon:
                 sd_show_meter=mic_cfg.sd_show_meter,
                 wake_words=wake_words,
                 voice_verifier=self._voice_verifier,
+                speaker_verifier=self._speaker_verifier,
+                vad=self._vad,
                 wake_stt_engine=self._wake_stt,
             )
         else:
@@ -547,6 +576,7 @@ class KairoDaemon:
                 loop=self._loop,
                 wake_words=wake_words,
                 voice_verifier=self._voice_verifier,
+                speaker_verifier=self._speaker_verifier,
                 openwakeword_detector=oww,
                 wake_stt_engine=self._wake_stt,
                 oww_whisper_verify=self._config.wake.oww_whisper_verify,
