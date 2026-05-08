@@ -3,6 +3,13 @@
 *.egg-info/
 __pycache__/
 *.py[cod]
+.idea/
+
+# Local-only / experiments — not part of published Kairo source tree
+.cursor/
+.claude/
+docs/superpowers/
+newThing/
 
 # Model weights — never commit binaries
 *.safetensors
@@ -12,4 +19,3 @@ __pycache__/
 *.pt
 *.pth
 models/
-newThing/whisper-model/

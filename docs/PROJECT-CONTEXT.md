@@ -10,7 +10,7 @@ This document captures **product intent**, **as-built behavior**, **configuratio
 
 It is a **local-first, voice-driven developer companion**: not a stateless chatbot, but a **runtime layer** that can observe workflow context, remember patterns, speak and listen on-device, and execute tools (apps, URLs, workspace modes, etc.).
 
-The installable Python distribution is **`kairo-runtime`** (`pyproject.toml`). The on-disk source tree is **`kairo/`**. User data defaults to **`~/.kairo/`** (logs, SQLite, Chroma, enrollments).
+The installable Python distribution is **`kairo-runtime`** (`pyproject.toml`). The **Git repository root** is the source tree (no nested `kairo/` package directory). User data defaults to **`~/.kairo/`** (logs, SQLite, Chroma, enrollments).
 
 ---
 
@@ -205,7 +205,7 @@ These came from an explicit codebase review; they are **not all fixed** yet:
 ### 10.2 Tests
 
 ```bash
-cd kairo
+cd KAIRO
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 pytest tests/ -v

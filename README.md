@@ -58,7 +58,7 @@ KAIRO is **not** a chatbot. It is a **runtime companion layer** that:
 
 ## This repository
 
-The `kairo/` directory is the runtime source tree. The installable package is **`kairo-runtime`** (`pyproject.toml`). Layout: core runtime, tool registry, platform adapters, memory, sensors, and voice services.
+The **repository root** is the runtime source tree (Python package **`kairo-runtime`**, see `pyproject.toml`): runtime, core, adapters, memory, sensors, voice/STT, tests, and tools.
 
 For as-built architecture, configuration, planner/reasoner flow, wake/STT options, and upgrades, see **[docs/PROJECT-CONTEXT.md](docs/PROJECT-CONTEXT.md)**.
 
@@ -74,7 +74,8 @@ For as-built architecture, configuration, planner/reasoner flow, wake/STT option
 ## Setup
 
 ```bash
-cd kairo
+git clone https://github.com/TonyStark0801/KAIRO.git
+cd KAIRO
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
